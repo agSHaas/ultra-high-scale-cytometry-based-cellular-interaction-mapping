@@ -1,0 +1,1037 @@
+---
+title: "Data Analysis Intestinal Cells"
+output: html_notebook
+author: "Viktoria Flore"
+date: "2024-11-28"
+---
+
+Analysis of the intestinal dataset from Funk et al. (2023) Developmental Cell, 
+https://doi.org/10.1016/j.devcel.2023.11.013. Flow cytometry data was pre-processed 
+with PeacoQC and events with irregular flow rates were removed from the analysis.
+The compensation remained unchanged; data was logicle transformed. 
+
+
+# load packages and set paths 
+```{r results='hide', message=FALSE, warning=FALSE}
+library(stringr)
+library(Seurat)
+library(ggalluvial)
+library(ggpubr)
+library(viridis)
+library(clustree)
+library(ggpointdensity)
+library(plotly)
+library(sp)
+library(corrplot)
+library(PerformanceAnalytics)
+library(Hmisc)
+library(PICtR)
+library(writexl)
+
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 2e9)
+
+dir <- "./intestinal_cells/"
+input.dir <- "./intestinal_cells/csv_files/"
+data.dir <- "./intestinal_cells/data/"
+plot.dir <- "./intestinal_cells/plots/"
+
+# create directory structure if not already present 
+for (d in c(data.dir, plot.dir, input.dir)) {
+  ifelse(!dir.exists(d), dir.create(d), FALSE)
+}
+```
+
+# load data 
+```{r, message=FALSE, warning=FALSE}
+# find channel value csv files 
+files <- dir(paste0(input.dir), pattern="*.csv")
+
+message("reading data...")
+# read channel values and save in list
+file_list <- lapply(files, function(csv) {
+  # read csv
+  tab <- read.table(paste0(input.dir, csv), header = T, sep = ",")
+  # extract meta data
+  tab$sample <- csv
+  return(tab)
+})
+
+# combine into one dataframe
+data <- bind_rows(file_list)
+
+
+# formatting
+data <- data %>%
+  mutate(group = case_when(
+    str_detect(sample, "aged") ~ "aged",
+    str_detect(sample, "young") ~ "young")) %>% 
+  mutate(replicate = str_extract(sample, "_([0-9])_", group = 1)) %>% 
+  mutate(batch = if_else(replicate == 1, "A", "B")) %>% 
+  dplyr::select(-c(Event.., FSC.A...FSC.H))
+
+  
+# sketching
+message("sketching...")
+obj <- sketch_wrapper(channel=data[,c(1:3,6,8:26)],
+                      meta_data=data,
+                      assay="FACS",
+                      FSC.A="FSC.A",
+                      FSC.H="FSC.H",
+                      n_sketch_cells=400000,
+                      resolution=c(0.3,0.5,1,2),
+                      obj_name="obj_sketched_non_projected",
+                      verbose=TRUE,
+                      BPcell_dir=NULL,
+                      ratio=TRUE,
+                      working_dir=data.dir)
+```
+
+# quality control
+```{r}
+# subset meta.data from sketched cells 
+sketched <- obj@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# check sketched contributions per sample
+DefaultAssay(obj) <- "FACS"
+total <- length(Cells(obj))
+DefaultAssay(obj) <- "sketch"
+ 
+obj@meta.data %>% 
+  group_by(sample) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+sketched %>% 
+  group_by(sample) %>% 
+  count() %>% 
+  mutate(of_total = n / nrow(sketched)) # all good, comparable 
+
+# QC plots ----
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "02_qc/")), dir.create(paste0(plot.dir, "02_qc/")), FALSE)
+
+# per group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "group") 
+dev.off()
+
+# sample
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_sample.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "sample") 
+dev.off()
+
+# check area/height ratio distribution and cutoff
+cutoff <- calculateThreshold(hist(obj$ratio, breaks = 2000, plot = FALSE))
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_ratio_histogram.pdf"), height = 6, width = 8, onefile = T)
+hist(obj$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off() # not optimal but likely works for interactions between epithelial cells and immune cells 
+
+# batch
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_batch.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "batch") 
+dev.off()
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_batch_split.pdf"), height = 7, width = 9, onefile = T)
+split_plot_sketch(obj, group_by = "batch", split_by = "batch") 
+dev.off()
+
+# ratio anno 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_ratio_threshold.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "ratio_anno") 
+dev.off()
+
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "03_annotation/")), dir.create(paste0(plot.dir, "03_annotation/")), FALSE)
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_feature_plots.pdf"), height = 7, width = 14, onefile = T)
+FeaturePlot(obj, features = colnames(obj@meta.data)[c(4:6,9:17)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj, features = colnames(obj@meta.data)[c(18:29)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj, features = colnames(obj@meta.data)[c(30,37)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+# RidgePlot
+resolution <- c("sketch_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2") # clustering resolutions
+
+features <- Features(obj)
+for (res in resolution) {
+  Idents(obj) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_ridgeplots_", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(obj, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+```
+
+# look at CD45+ EPCAM+ double-positive events / potential interactions
+```{r}
+ggplot(sketched, aes(x = EPCAM, y = CD45)) + geom_point()
+ggplot(sketched %>% dplyr::filter(ratio < 600), aes(x = EPCAM, y = CD45, color = ratio)) + geom_point() 
+ 
+ggplot(sketched, aes(x = ratio, color = sketch_snn_res.0.5)) + geom_histogram(bins = 2000) + facet_wrap(~sketch_snn_res.0.5) # mostly looks like clusters with a high ratio are distinct
+```
+
+# identify doublet clusters
+```{r}
+# clustering resolutions
+resolution <- c("sketch_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "01_doublets/")), dir.create(paste0(plot.dir, "01_doublets/")), FALSE)
+
+# ratio cluster plots and preliminary selection of doublet clusters
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_ratio_cluster_plots_all_events.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  obj <- select_dbt(obj, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(obj, clusters = res))
+}
+dev.off()
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_dimplot_clusters.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(obj, reduction = 'umap', group.by = res, label = T) + 
+          labs(title = paste0(res)))
+}
+dev.off()
+
+# clustree plot
+sketched <- obj@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+subset <- subset(obj, cells = rownames(sketched))
+
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_clustree_all_events.pdf"), height = 7, width = 14)
+clustree(subset, prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off()
+
+# highlight each cluster
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_dimplot_clusters_highlighted_res.1.pdf"), height = 7, width = 9, onefile = T)
+Idents(obj) <- "sketch_snn_res.1"
+for (i in levels(obj$sketch_snn_res.1)) {
+  print(DimPlot(obj, reduction = 'umap', label = T, cells.highlight = WhichCells(obj, idents = i)) + 
+        labs(title = paste0(i)))
+}
+dev.off()
+
+
+#####################
+##                 ##
+##     choose      ##
+##   resolution    ##
+##       1         ##
+##                 ##
+#####################
+
+# subcluster 
+Idents(obj) <- "sketch_snn_res.1"
+obj <- FindSubCluster(obj, cluster = "16", subcluster.name = "sub.cluster", resolution = 0.1, graph.name = "sketch_snn")
+Idents(obj) <- "sub.cluster"
+obj <- FindSubCluster(obj, cluster = "27", subcluster.name = "sub.cluster", resolution = 0.1, graph.name = "sketch_snn")
+Idents(obj) <- "sub.cluster"
+obj <- FindSubCluster(obj, cluster = "28", subcluster.name = "sub.cluster", resolution = 0.1, graph.name = "sketch_snn")
+Idents(obj) <- "sub.cluster"
+
+# plot
+DimPlot(obj, group.by = "sub.cluster", label = T)
+
+# save 
+saveRDS(obj, paste0(data.dir, "obj_sketched_non_projected_subclustered.rds"))
+
+# project chosen clustering to all cells
+obj@meta.data <- obj@meta.data %>% 
+  mutate(sub.cluster = str_replace(sub.cluster, "_", "."))
+obj <- predict_data(obj = obj,
+                    data_query = obj,
+                    ref_clusters = "sub.cluster",
+                    FSC.A="FSC.A",
+                    FSC.H="FSC.H",
+                    pred_name="pred_snn_res.1",
+                    chunk_size=1000000,
+                    assay_ref = "sketch",
+                    assay_query = "FACS")
+
+# save obj
+saveRDS(obj, file = paste0(data.dir, "obj_sketched_projected.rds"))
+
+# ratio cluster plot for all projected cells
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_ratio_cluster_plots_all_cells_projected.pdf"), height = 7, width = 14)
+ratio_cluster_plot(obj, clusters = "pred_snn_res.1", ratio = "ratio_anno", assay = "FACS")
+dev.off()
+
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_ratio_cluster_plots_subclustered.pdf"), height = 7, width = 20)
+  DefaultAssay(obj) <- "FACS"
+  print(obj@meta.data %>%
+    group_by(pred_snn_res.1, ratio_anno) %>%
+    count(ratio_anno) %>%
+    ggplot(aes(x = pred_snn_res.1, y = n, fill = ratio_anno)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_fill_manual(values = rev(c("orange2",
+    "dodgerblue2"))) +
+    xlab("Clusters") +
+    labs(y = "Count") +
+    ggtitle("Cluster Analysis") +
+    theme_minimal())
+dev.off() 
+
+# select doublet clusters
+obj <- select_dbt(obj, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.80)
+
+# add meta.data
+dbts <- obj@misc$doublet_clusters_res.1_q0.8
+obj@meta.data <- obj@meta.data %>%
+  mutate(cluster_anno = if_else(condition = as.character(pred_snn_res.1) %in% dbts, true = "doublet_cluster", false = "singlet_cluster"))
+
+# save obj
+saveRDS(obj, file = paste0(data.dir, "obj_sketched_projected.rds"))
+```
+
+# singlet annotation 
+```{r}
+# anno  ------------------------------------------------------------------------------
+obj@meta.data <- mutate(obj@meta.data, celltype = case_when(
+  pred_snn_res.1 == "0" ~ "Epithelial cells",
+  pred_snn_res.1 == "1" ~ "Epithelial cells",
+  pred_snn_res.1 == "2" ~ "CD8+ TCRgd+ T cells",
+  pred_snn_res.1 == "3" ~ "CD8+ TCRab+ T cells",
+  pred_snn_res.1 == "4" ~ "Epithelial cells",
+  pred_snn_res.1 == "5" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "6" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "7" ~ "Epithelial cells",
+  pred_snn_res.1 == "8" ~ "Epithelial cells",
+  pred_snn_res.1 == "9" ~ "ISCs",
+  pred_snn_res.1 == "10" ~ "ISC aggregates",
+  pred_snn_res.1 == "11" ~ "Epithelial cells",
+  pred_snn_res.1 == "12" ~ "CD4+ TCRab+ T cells",
+  pred_snn_res.1 == "13" ~ "pDCs",
+  pred_snn_res.1 == "14" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "15" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "16" ~ "Epithelial cells",
+  pred_snn_res.1 == "16.1" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "16.2" ~ "Epithelial cells",
+  pred_snn_res.1 == "17" ~ "CD8+ TCRgd+ T cells",
+  pred_snn_res.1 == "18" ~ "PICs",
+  pred_snn_res.1 == "19" ~ "Epithelial cells",
+  pred_snn_res.1 == "20" ~ "CD4+ CD8+ TCRab+ T cells",
+  pred_snn_res.1 == "21" ~ "CD8+ TCRgd+ T cells",
+  pred_snn_res.1 == "22" ~ "CD8- TCRgd+ T cells",
+  pred_snn_res.1 == "23" ~ "DCs",
+  pred_snn_res.1 == "24" ~ "Epithelial cells",
+  pred_snn_res.1 == "25" ~ "B cells",
+  pred_snn_res.1 == "26" ~ "Epithelial cells",
+  pred_snn_res.1 == "27" ~ "NK",
+  pred_snn_res.1 == "27.1" ~ "CD45+",
+  pred_snn_res.1 == "27.2" ~ "CD45+",
+  pred_snn_res.1 == "27.3" ~ "NK",
+  pred_snn_res.1 == "28" ~ "NK",
+  pred_snn_res.1 == "28.1" ~ "CD8+ CD11b+ effector T cells",
+  pred_snn_res.1 == "29" ~ "Myeloid cells",
+  pred_snn_res.1 == "30" ~ "PICs",
+  pred_snn_res.1 == "31" ~ "DCs", 
+  pred_snn_res.1 == "32" ~ "PICs", 
+  pred_snn_res.1 == "33" ~ "CD45+", 
+  pred_snn_res.1 == "34" ~ "Epithelial cells",
+  pred_snn_res.1 == "35" ~ "Myeloid cells", 
+  pred_snn_res.1 == "36" ~ "remove", # compensation issues  
+  pred_snn_res.1 == "37" ~ "CD8+ TCRab+ T cells", 
+  pred_snn_res.1 == "38" ~ "CD8+ TCRab+ T cells",  
+  pred_snn_res.1 == "39" ~ "remove" # negative for everything
+))
+
+DimPlot(obj, group.by = "celltype", label =T)
+
+# save annotated obj
+saveRDS(obj, paste0(data.dir, "obj_sketched_subclustered_projected_annotated.rds"))
+
+# remove unidentifyable clusters
+subset <- obj@meta.data %>% dplyr::filter(!celltype %in% c("remove"))
+obj_clean <- subset(obj, cells = rownames(subset))
+
+# re-calculate UMAP
+DefaultAssay(obj_clean) <- "sketch"
+n_dims <- length(Features(obj_clean))
+obj_clean <- obj_clean %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs = n_dims - 1, approx = F) %>%
+  FindNeighbors(dims = 1:n_dims - 1) %>%
+  # FindClusters(resolution = c(0.3, 0.5, 1, 2)) %>%
+  RunUMAP(dims = 1:n_dims - 1, return.model = TRUE)
+
+obj_clean$umap_1 <- obj_clean@reductions$umap@cell.embeddings[,1]
+obj_clean$umap_2 <- obj_clean@reductions$umap@cell.embeddings[,2]
+
+# save annotated obj
+saveRDS(obj_clean, paste0(data.dir, "obj_sketched_subclustered_projected_annotated_filtered.rds"))
+
+# plots ----------------------------------------------
+# per group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj_clean, group.by = "group") 
+dev.off()
+
+# sample
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_sample_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj_clean, group.by = "sample") 
+dev.off()
+
+# batch 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_batch_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj_clean, group.by = "batch") 
+dev.off()
+
+# check area/height ratio distribution and cutoff
+cutoff <- calculateThreshold(hist(obj_clean$ratio, breaks = 2000, plot = FALSE))
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_ratio_histogram_clean.pdf"), height = 6, width = 8, onefile = T)
+hist(obj_clean$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off() 
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_feature_plots_clean.pdf"), height = 7, width = 14, onefile = T)
+FeaturePlot(obj_clean, features = colnames(obj@meta.data)[c(4:6,9:17)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj_clean, features = colnames(obj@meta.data)[c(18:29)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj_clean, features = colnames(obj@meta.data)[c(30,37)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+```
+
+# plot singlet object 
+```{r}
+# obj_clean <- readRDS(paste0(data.dir, "obj_sketched_subclustered_projected_annotated_filtered.rds"))
+
+obj_clean@meta.data <- mutate(obj_clean@meta.data, celltype = case_when(
+  pred_snn_res.1 == "0" ~ "Epithelial cells",
+  pred_snn_res.1 == "1" ~ "Epithelial cells",
+  pred_snn_res.1 == "2" ~ "CD8+ TCRgd+ T cells",
+  pred_snn_res.1 == "3" ~ "CD8+ TCRab+ T cells",
+  pred_snn_res.1 == "4" ~ "Epithelial cells",
+  pred_snn_res.1 == "5" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "6" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "7" ~ "Epithelial cells",
+  pred_snn_res.1 == "8" ~ "Epithelial cells",
+  pred_snn_res.1 == "9" ~ "ISCs",
+  pred_snn_res.1 == "10" ~ "ISC aggregates",
+  pred_snn_res.1 == "11" ~ "Epithelial cells",
+  pred_snn_res.1 == "12" ~ "CD4+ TCRab+ T cells",
+  pred_snn_res.1 == "13" ~ "pDCs",
+  pred_snn_res.1 == "14" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "15" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "16" ~ "Epithelial cells",
+  pred_snn_res.1 == "16.1" ~ "Epithelial aggregates",
+  pred_snn_res.1 == "16.2" ~ "Epithelial cells",
+  pred_snn_res.1 == "17" ~ "CD8+ TCRgd+ T cells",
+  pred_snn_res.1 == "18" ~ "PICs",
+  pred_snn_res.1 == "19" ~ "Epithelial cells",
+  pred_snn_res.1 == "20" ~ "CD4+ CD8+ TCRab+ T cells",
+  pred_snn_res.1 == "21" ~ "CD8+ TCRgd+ T cells",
+  pred_snn_res.1 == "22" ~ "CD8- TCRgd+ T cells",
+  pred_snn_res.1 == "23" ~ "DCs",
+  pred_snn_res.1 == "24" ~ "Epithelial cells",
+  pred_snn_res.1 == "25" ~ "B cells",
+  pred_snn_res.1 == "26" ~ "Epithelial cells",
+  pred_snn_res.1 == "27" ~ "NK",
+  pred_snn_res.1 == "27.1" ~ "CD45+",
+  pred_snn_res.1 == "27.2" ~ "CD45+",
+  pred_snn_res.1 == "27.3" ~ "NK",
+  pred_snn_res.1 == "28" ~ "NK",
+  pred_snn_res.1 == "28.1" ~ "CD8+ CD11b+ effector T cells",
+  pred_snn_res.1 == "29" ~ "Myeloid cells",
+  pred_snn_res.1 == "30" ~ "PICs",
+  pred_snn_res.1 == "31" ~ "DCs", 
+  pred_snn_res.1 == "32" ~ "PICs", 
+  pred_snn_res.1 == "33" ~ "CD45+", 
+  pred_snn_res.1 == "34" ~ "Epithelial cells",
+  pred_snn_res.1 == "35" ~ "Myeloid cells", 
+  # pred_snn_res.1 == "36" ~ "remove", # compensation issues  
+  pred_snn_res.1 == "37" ~ "CD8+ TCRab+ T cells", 
+  pred_snn_res.1 == "38" ~ "CD8+ TCRab+ T cells",  
+  # pred_snn_res.1 == "39" ~ "remove" # negative for everything
+))
+
+
+cols <- c("CD4+ TCRab+ T cells" = "palegreen",
+          "CD45+" = "thistle",
+          "CD8+ CD11b+ effector T cells" = "dodgerblue4",
+          "CD8+ TCRab+ T cells" = "deepskyblue2",
+          "CD8+ TCRgd+ T cells" = "#4B76BA",
+          "CD8- TCRgd T cells" = "#89CCED",
+          "CD4+ CD8+ TCRab+ T cells" = "darkolivegreen4",
+          "PICs" = "orange",
+          "B cells" = "#12783D",    
+          "NK" = "mediumpurple4",           
+          "Myeloid cells" = "gold1",        
+          "Epithelial cells" = "#761F5F",   
+          "ISCs" = "violetred3",
+          "ISC aggregates" = "violetred4",
+          "Epithelial aggregates" = "#4d123d",
+          "DCs" = "#BF89BD", 
+          "pDCs" = "purple4")
+
+# UMAP Supplementary Figure 5B
+pdf(paste0(plot.dir, Sys.Date(), "_ISCs_overall_umap.pdf"), height = 6, width = 9)
+obj_clean@meta.data %>% dplyr::slice_sample(prop = 1) %>% # randomly order
+  ggplot(aes(umap_1, umap_2, color = celltype)) +
+  ggrastr::geom_point_rast(size = 0.2, color = "black", raster.dpi = 700) +
+  ggrastr::geom_point_rast(aes(color = as.factor(celltype)), size = 0.05, raster.dpi = 700) +
+  scale_color_manual(values = cols) +
+  theme_classic() +
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+dev.off()
+```
+
+# PICs involving immune cells and epithelial cells
+```{r}
+# subset interacting cells 
+subset <- obj_clean@meta.data %>% dplyr::filter(celltype == "PICs")
+dbts_obj <- subset(obj_clean, cells = rownames(subset))
+
+# repeat seurat workflow
+DefaultAssay(dbts_obj) <- "FACS" # only ~40k events, sketching not necessary  
+resolution <- c(0.3, 0.5, 1, 2)
+n_dims <- Features(dbts_obj) %>% length()
+dbts_obj <- dbts_obj %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs=n_dims-1, approx=F, reduction.name = "pca_dbts") %>%
+  FindNeighbors(dims = 1:n_dims-1, reduction = "pca_dbts") %>%
+  FindClusters(resolution = resolution, graph.name = "FACS_snn") %>%
+  RunUMAP(dims = 1:n_dims-1, return.model = TRUE, reduction = "pca_dbts", reduction.name = "umap_dbts")
+
+# save obj
+saveRDS(dbts_obj, paste0(data.dir, "dbts_sketched.rds"))
+```
+
+# PIC annotation
+```{R}
+ifelse(!dir.exists(paste0(plot.dir, "04_doublet_annotation/")), dir.create(paste0(plot.dir, "04_doublet_annotation/")), FALSE)
+resolution <- c(0.3, 0.5, 1, 2)
+
+# plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_clusters_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_obj, reduction = 'umap_dbts', group.by = paste0("FACS_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_feature_plots_doublets.pdf"), height = 9, width = 14, onefile = T)
+FeaturePlot(dbts_obj, reduction = 'umap_dbts', features = colnames(dbts_obj@meta.data)[c(4:6,9:17)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj, reduction = 'umap_dbts', features = colnames(dbts_obj@meta.data)[c(18:29)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj, reduction = 'umap_dbts', features = colnames(dbts_obj@meta.data)[c(30,37)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+
+# RidgePlots
+features <- Features(dbts_obj)
+for (res in resolution) {
+  Idents(dbts_obj) <- paste0("FACS_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_ridgeplots_", res, "_dbts_obj.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_obj, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "group", reduction = 'umap_dbts')
+dev.off()
+
+# batch 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_batch_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "batch", reduction = 'umap_dbts')
+dev.off()
+
+# sample
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_sample_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "sample",reduction = 'umap_dbts')
+dev.off() # all good 
+
+
+#######################
+##                   ##
+##      choose       ##
+##   resolution 2    ##
+##                   ##
+#######################
+
+# check clustering solution with resolution = 2
+Idents(dbts_obj) <- "FACS_snn_res.2"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_highlighted_clusters_res2_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (i in levels(dbts_obj$FACS_snn_res.2)) {
+  print(DimPlot(dbts_obj, reduction = "umap_dbts", cells.highlight = WhichCells(dbts_obj, idents = i)) + labs(title = i))
+}
+dev.off()
+
+# subcluster 
+Idents(dbts_obj) <- "FACS_snn_res.2"
+dbts_obj <- FindSubCluster(dbts_obj, cluster = "14", resolution = 0.1, subcluster.name = "sub.cluster", graph.name = "FACS_snn")
+Idents(dbts_obj) <- "sub.cluster"
+dbts_obj <- FindSubCluster(dbts_obj, cluster = "21", resolution = 0.2, subcluster.name = "sub.cluster", graph.name = "FACS_snn")
+
+DimPlot(dbts_obj, reduction = "umap_dbts", group.by = "sub.cluster", label =T)
+
+# anno ----
+# unclear which T cell populations are also truly positive for CD4 in addition to CD8
+dbts_obj@meta.data <- mutate(dbts_obj@meta.data, doublet_type = case_when(
+  FACS_snn_res.2 == "0"~ "Ep*CD4+ TCRab+ T cells",
+  FACS_snn_res.2 == "1"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "2"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "3"~ "Ep*CD8+ TCRab+ T cells",
+  FACS_snn_res.2 == "4"~ "Ep", # homotypic 
+  FACS_snn_res.2 == "5"~ "Ep", # homotypic 
+  FACS_snn_res.2 == "6"~ "Ep*CD8+ TCRab+ T cells",
+  FACS_snn_res.2 == "7"~ "Ep*TCRgd+ T cells",
+  FACS_snn_res.2 == "8"~ "Ep*CD8+ TCRab+ T cells",
+  FACS_snn_res.2 == "9"~ "Ep*T",
+  FACS_snn_res.2 == "10"~ "DCs", # homotypic 
+  FACS_snn_res.2 == "11"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "12"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "13"~ "Ep", # homotypic 
+  FACS_snn_res.2 == "14"~ "ISC*CD8+ TCRab+ T cells", # subcluster 
+  FACS_snn_res.2 == "15"~ "TCRab*TCRgd",
+  FACS_snn_res.2 == "16"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "17"~ "Ep*CD8+ TCRgd+ T cells", # subcluster? 
+  FACS_snn_res.2 == "18"~ "Ep*T",
+  FACS_snn_res.2 == "19"~ "Ep", # potentially singlets 
+  FACS_snn_res.2 == "20"~ "ISC*T",
+  FACS_snn_res.2 == "21"~ "Ep*T",
+  FACS_snn_res.2 == "22"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "23"~ "TCRab*TCRgd",
+  FACS_snn_res.2 == "24"~ "Ep*DC",
+  FACS_snn_res.2 == "25"~ "Ep*B220?",
+  FACS_snn_res.2 == "26"~ "My", # homotypic 
+  FACS_snn_res.2 == "27"~ "Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "28"~ "CD324+ Ep*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "29"~ "Ep*DC",
+  FACS_snn_res.2 == "30"~ "DC*TCRgd T cells"
+))
+
+DimPlot(dbts_obj, group.by = "doublet_type", label = T, reduction = "umap_dbts")
+
+# save annotated obj
+saveRDS(dbts_obj, paste0(data.dir, "dbts_sketched_projected_annotated.rds"))
+```
+
+# clean doublet anno 
+```{R}
+# remove homotypic interactions
+subset <- dbts_obj@meta.data %>%
+  dplyr::filter(!doublet_type %in% c("DCs", "Ep", "My"))
+
+dbts_obj_clean <- subset(dbts_obj, cells = rownames(subset))
+
+# repeat Seurat workflow
+DefaultAssay(dbts_obj_clean) <- "FACS"
+resolution <- c(0.5, 1, 2)
+n_dims <- Features(dbts_obj_clean) %>% length()
+dbts_obj_clean <- dbts_obj_clean %>%
+  FindVariableFeatures() %>% 
+  ScaleData() %>%
+  RunPCA(npcs=n_dims-1, approx=F, reduction.name = "pca_clean") %>%
+  FindNeighbors(dims = 1:n_dims-1, reduction = "pca_clean") %>%
+  FindClusters(resolution = resolution, graph.name = "FACS_snn") %>%
+  RunUMAP(dims = 1:n_dims-1, return.model = TRUE, reduction = "pca_clean", reduction.name = "umap_clean")
+
+DimPlot(dbts_obj_clean, group.by = "doublet_type", label = T, reduction = "umap_clean")
+
+# only markers that have been used during singlet anno -------------
+dbts_obj_clean_sub <- dbts_obj_clean
+VariableFeatures(dbts_obj_clean_sub) <- VariableFeatures(dbts_obj_clean_sub)[!VariableFeatures(dbts_obj_clean_sub) %in% c("CD274", "Ly6G", "CD279", "F4-80")]
+n_dims <- VariableFeatures(dbts_obj_clean_sub) %>% length()
+dbts_obj_clean_sub <- dbts_obj_clean_sub %>% 
+  ScaleData() %>%
+  RunPCA(npcs=n_dims-1, approx=F, reduction.name = "pca_clean") %>%
+  FindNeighbors(dims = 1:n_dims-1, reduction = "pca_clean") %>%
+  FindClusters(resolution = resolution, graph.name = "FACS_snn") %>%
+  RunUMAP(dims = 1:n_dims-1, return.model = TRUE, reduction = "pca_clean", reduction.name = "umap_clean") # looks more reliable, use this
+
+# save filtered data
+saveRDS(dbts_obj_clean, paste0(data.dir, "dbts_filtered.rds"))
+saveRDS(dbts_obj_clean_sub, paste0(data.dir, "dbts_filtered_marker_subset.rds"))
+
+
+# plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_clusters_doublets_clean_marker_subset.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_obj_clean_sub, group.by = paste0("FACS_snn_res.", res), label = T, reduction = 'umap_clean'))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_feature_plots_doublets_clean_marker_subset.pdf"), height = 9, width = 14, onefile = T)
+FeaturePlot(dbts_obj_clean_sub, reduction = 'umap_clean', features = colnames(dbts_obj@meta.data)[c(4:6,9:17)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj_clean_sub, reduction = 'umap_clean', features = colnames(dbts_obj@meta.data)[c(18:29)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj_clean_sub, reduction = 'umap_clean', features = colnames(dbts_obj@meta.data)[c(30,37)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+# RidgePlots
+features <- Features(dbts_obj_clean_sub)
+for (res in resolution) {
+  Idents(dbts_obj_clean_sub) <- paste0("FACS_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_ridgeplots_", res, "_dbts_obj_clean_sub_marker_subset.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_obj_clean_sub, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group_dbts_obj_clean_sub_marker_subset.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean_sub, group.by = "group", reduction = 'umap_clean')
+dev.off()
+
+# batch
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_batch_dbts_obj_clean_sub_marker_subset.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean_sub, group.by = "batch", reduction = 'umap_clean')
+dev.off()
+
+# sample
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_sample_dbts_obj_clean_sub_marker_subset.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean_sub, group.by = "sample",  reduction = 'umap_clean')
+dev.off()
+
+# check clustering solution with resolution = 2
+Idents(dbts_obj_clean_sub) <- "FACS_snn_res.2"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_highlighted_clusters_res2_doublets_clean_marker_subset.pdf"), height = 7, width = 9, onefile = T)
+for (i in levels(dbts_obj_clean_sub$FACS_snn_res.2)) {
+  print(DimPlot(dbts_obj_clean_sub, reduction = "umap_clean", cells.highlight = WhichCells(dbts_obj_clean_sub, idents = i)) + labs(title = i))
+}
+dev.off()
+
+# subcluster 
+Idents(dbts_obj_clean_sub) <- "FACS_snn_res.2"
+dbts_obj_clean_sub <- FindSubCluster(dbts_obj_clean_sub, cluster = "20", graph.name = "FACS_snn", resolution = 0.4, subcluster.name = "sub.cluster")
+Idents(dbts_obj_clean_sub) <- "sub.cluster"
+dbts_obj_clean_sub <- FindSubCluster(dbts_obj_clean_sub, cluster = "26", graph.name = "FACS_snn", resolution = 0.4, subcluster.name = "sub.cluster")
+Idents(dbts_obj_clean_sub) <- "sub.cluster"
+
+DimPlot(dbts_obj_clean_sub, group.by = "sub.cluster", reduction = "umap_clean", label = T)
+```
+
+# clean doublet anno 
+```{r}
+# unclear which T cell populations are also truly positive for CD4 in addition to CD8 due to panel design
+dbts_obj_clean_sub@meta.data <- mutate(dbts_obj_clean_sub@meta.data, doublet_type = case_when(
+  FACS_snn_res.2 == "0"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "1"~ "Epithelial*CD4+ TCRab+ T cells",
+  FACS_snn_res.2 == "2"~ "Epithelial*TCRab+ T cells",
+  FACS_snn_res.2 == "3"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "4"~ "Epithelial*TCRab+ T cells", 
+  FACS_snn_res.2 == "5"~ "Epithelial*CD8+ TCRgd+ T cells", 
+  FACS_snn_res.2 == "6"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "7"~ "Epithelial*TCRab+ T cells",
+  FACS_snn_res.2 == "8"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "9"~ "TCRab+*TCRgd+ T cells",
+  FACS_snn_res.2 == "10"~ "Epithelial*CD8+ TCRgd+ T cells", 
+  FACS_snn_res.2 == "11"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "12"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "13"~ "Epithelial*CD8+ TCRgd+ T cells", 
+  FACS_snn_res.2 == "14"~ "ISCs*CD8+ TCRgd+ T cells",  
+  FACS_snn_res.2 == "15"~ "Epithelial*CD4+ TCRab+ T cells",
+  FACS_snn_res.2 == "16"~ "Epithelial*TCRab+ T cells",
+  FACS_snn_res.2 == "17"~ "ISC*TCRab+ T cells", 
+  FACS_snn_res.2 == "18"~ "Epithelial*CD8+ TCRab+ T cells",
+  FACS_snn_res.2 == "19"~ "TCRab+*TCRgd+ T cells", 
+  sub.cluster == "20_0"~ "Epithelial*pDCs",
+  sub.cluster == "20_1"~ "Epithelial*pDCs",
+  sub.cluster == "20_2"~ "ISCs*pDCs",
+  FACS_snn_res.2 == "21"~ "Epithelial*B cells",
+  FACS_snn_res.2 == "22"~ "Epithelial*CD8- TCRgd+ T cells",
+  FACS_snn_res.2 == "23"~ "Epithelial*CD8+ TCRgd+ T cells",
+  FACS_snn_res.2 == "24"~ "CD324+ Epithelial*T cells",
+  FACS_snn_res.2 == "25"~ "Epithelial*CD8+ TCRgd+ T cells*B cells",
+  sub.cluster == "26_0"~ "Epithelial*DCs",
+  sub.cluster == "26_1"~ "ISCs*DCs",
+  FACS_snn_res.2 == "27"~ "CD8+ TCRgd+ T cells*pDCs"
+))
+
+DimPlot(dbts_obj_clean_sub, reduction = "umap_clean", label = T, group.by = "doublet_type")
+```
+
+# plot doublets
+```{R}
+# UMAP
+cols <- c("Epithelial*CD8+ TCRgd+ T cells" = "royalblue1",
+ "TCRab+*TCRgd+ T cells" = "olivedrab1",
+ "Epithelial*TCRab+ T cells" = "#85AB70",
+ "Epithelial*CD4+ TCRab+ T cells" = "#3BA455",
+ "Epithelial*pDCs" = "mediumpurple",
+ "ISC*TCRab+ T cells" = "deepskyblue2",
+ "CD324+ Epithelial*T cells" = "slateblue1",
+ "ISCs*CD8+ TCRgd+ T cells" = "turquoise",
+ "Epithelial*DCs" = "#F4C5CB",
+ "Epithelial*B cells" = "#08306B",
+ "ISCs*DCs" = "#E597B9",
+ "CD8+ TCRgd+ T cells*pDCs" = "plum4",
+ "Epithelial*CD8- TCRgd+ T cells" = "#3787C0",
+ "Epithelial*CD8+ TCRgd+ T cells*B cells" = "midnightblue",
+ "ISCs*pDCs" = "mediumorchid4",
+ "Epithelial*CD8+ TCRab+ T cells" = "deepskyblue4")
+  
+DimPlot(dbts_obj_clean_sub, group.by = "doublet_type", label = T, cols = cols, reduction = "umap_clean", pt.size = 2)
+
+dbts_obj_clean_sub$umap_1 <- dbts_obj_clean_sub@reductions$umap_clean@cell.embeddings[,1]
+dbts_obj_clean_sub$umap_2 <- dbts_obj_clean_sub@reductions$umap_clean@cell.embeddings[,2]
+
+# plot Supplementary Figure 5C
+pdf(paste0(plot.dir, Sys.Date(), "_intestinal_doublets_umap_lgr5scaled_marker_subset_v2.pdf"), height = 6, width = 9)
+dbts_obj_clean_sub@meta.data %>% 
+  ggplot(aes(umap_1, umap_2, color = doublet_type)) + 
+  ggrastr::geom_point_rast(size = 1, color = "black", raster.dpi = 700) + 
+  ggrastr::geom_point_rast(aes(color = as.factor(doublet_type)), size = 0.5, raster.dpi = 700) + 
+  scale_color_manual(values = cols) + 
+  theme_classic() + 
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+dev.off()
+
+# save 
+saveRDS(dbts_obj_clean_sub, paste0(data.dir, "dbts_filtered_marker_subset.rds"))
+```
+
+# quantification singlets 
+```{r}
+live_cells <- obj_clean@meta.data %>% 
+  count(sample, name = "live") 
+
+res <- obj_clean@meta.data %>% 
+  group_by(sample, group, celltype) %>% 
+  count() %>% 
+  left_join(live_cells, by = "sample") %>% 
+  mutate(freq = n / live) %>% 
+  mutate(group = case_when(group == "young" ~ "Y", 
+                           group == "aged" ~ "A")) %>% 
+  mutate(group = factor(group, levels = c("Y", "A")))
+
+res %>% dplyr::group_by(group, celltype) %>% shapiro_test(freq) # normality cannot be assumed
+
+stats <- res %>% 
+  group_by(celltype) %>% 
+  emmeans_test(freq ~ group) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% 
+  add_xy_position()
+
+
+# stripchart 
+pdf(paste0(plot.dir, Sys.Date(), "_quant_immune.pdf"), height = 6, width = 12)
+p <- ggstripchart(res %>% dplyr::filter(!celltype %in% c("Epithelial cells", "Epithelial aggregates", "ISCs", "ISC aggregates")), x = "group", y = "freq",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "celltype", jitter = 0.2, 
+             size = 6, add.params = list(color = "black"), shape = 21) + 
+  theme_pubclean() +
+  facet_wrap(~celltype, nrow = 1) +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5)
+print(p)
+dev.off()
+
+# T cell populations only (Supplementary Figure 5D)
+pdf(paste0(plot.dir, Sys.Date(), "_quant_Tcells.pdf"), height = 3, width = 10)
+p <- ggstripchart(res %>% 
+               dplyr::filter(celltype %in% c("CD8+ TCRgd+ T cells", "CD4+ TCRab+ T cells", "CD4+ CD8+ TCRab+ T cells", "CD8+ TCRab+ T cells", "CD8- TCRgd T cells", "CD8+ CD11b+ effector T cells")) %>% 
+               mutate(celltype = factor(celltype, levels = c("CD4+ TCRab+ T cells", "CD8+ TCRab+ T cells", "CD4+ CD8+ TCRab+ T cells", "CD8+ TCRgd+ T cells", "CD8- TCRgd T cells", "CD8+ CD11b+ effector T cells"))), 
+                      x = "group", y = "freq",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "celltype", jitter = 0.2, 
+             size = 6, add.params = list(color = "black"), shape = 21) + 
+  theme_classic() +
+  facet_wrap(~celltype, nrow = 1) +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5)
+print(p)
+dev.off()
+
+# export source data 
+write_xlsx(p$data, paste0(plot.dir, "source_data/Supplementary_Figure_5D_source_data.xlsx"))
+
+# T cell stats 
+res %>% dplyr::filter(celltype %in% c("CD8+ TCRgd+ T cells", "CD4+ TCRab+ T cells", 
+                                      "CD4+ CD8+ TCRab+ T cells", "CD8+ TCRab+ T cells", 
+                                      "CD8- TCRgd+ T cells", "CD8+ CD11b+ effector T cells")) %>% 
+  dplyr::group_by(group, celltype) %>% 
+  shapiro_test(freq) # normality cannot be assumed 
+
+stats_T <- res %>% 
+  dplyr::filter(celltype %in% c("CD8+ TCRgd+ T cells", "CD4+ TCRab+ T cells", 
+                                      "CD4+ CD8+ TCRab+ T cells", "CD8+ TCRab+ T cells", 
+                                      "CD8- TCRgd+ T cells", "CD8+ CD11b+ effector T cells")) %>% 
+  mutate(celltype = factor(celltype, levels = c("CD4+ TCRab+ T cells", "CD8+ TCRab+ T cells", 
+                                                "CD4+ CD8+ TCRab+ T cells", "CD8+ TCRgd+ T cells", 
+                                                "CD8- TCRgd+ T cells", "CD8+ CD11b+ effector T cells"))) %>%
+  group_by(celltype) %>% 
+  emmeans_test(freq ~ group) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% 
+  add_xy_position()
+
+# epithelial cells 
+pdf(paste0(plot.dir, Sys.Date(), "_quant_epithelial.pdf"), height = 6, width = 5)
+ggstripchart(res %>% dplyr::filter(celltype %in% c("Epithelial cells", "Epithelial aggregates", "ISCs", "ISC aggregates")), x = "group", y = "freq",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "celltype", jitter = 0.2, 
+             size = 6, add.params = list(color = "black"), shape = 21) + 
+  theme_pubclean() +
+  facet_wrap(~celltype, nrow = 1) +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5)
+dev.off()
+```
+
+
+# interacting cells 
+```{r}
+# live, high quality event counts
+live_sgl <- obj@meta.data %>%
+  dplyr::filter(!celltype %in% c("remove", "PICs")) %>%
+  group_by(sample) %>%
+  count(name = "live")
+
+live_dbts <- dbts_obj@meta.data %>% 
+  group_by(sample) %>%
+  count(name = "live_dbts")
+
+live <- left_join(live_sgl, live_dbts, by = "sample") %>% 
+  mutate(total = live + live_dbts)
+
+# add the meta.data
+dbts <- dbts_obj_clean_sub
+dbts@meta.data <- left_join(dbts_obj_clean_sub@meta.data, live, by = "sample")
+
+# qunatify, maintain groups with freq = 0
+res <- dbts@meta.data %>% 
+  mutate(sample = factor(sample), doublet_type = factor(doublet_type)) %>% 
+  group_by(sample, group, doublet_type, .drop = F) %>% 
+  count() %>% 
+  left_join(live_cells, by = "sample") %>% 
+  mutate(freq = n / live) %>% 
+  mutate(group = case_when(group == "young" ~ "Y", 
+                           group == "aged" ~ "A")) %>% 
+  mutate(group = factor(group, levels = c("Y", "A")))
+
+# stats 
+res %>% dplyr::group_by(group, doublet_type) %>% shapiro_test(freq) # normality cannot be assumed for everything
+
+stats_pic <- res %>% 
+  group_by(doublet_type) %>% 
+  emmeans_test(freq ~ group) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% 
+  add_xy_position()
+
+# plot 
+pdf(paste0(plot.dir, Sys.Date(), "_quant_PICs.pdf"), height = 5, width = 12)
+ggstripchart(res, x = "group", y = "freq",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "doublet_type", jitter = 0.2, 
+             size = 6, add.params = list(color = "black"), shape = 21) + 
+  theme_pubclean() +
+  facet_wrap(~doublet_type, nrow = 2) +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5)
+dev.off()
+
+# PICs involving T cells (Supplementary Figure 5E)
+pdf(paste0(plot.dir, Sys.Date(), "_quant_PICs.pdf"), height = 6, width = 8.5)
+p2 <- ggstripchart(res %>% dplyr::filter(str_detect(doublet_type, "T cells"), 
+                                   str_detect(doublet_type, "ISC|Epithelial")) %>% 
+               mutate(doublet_type = factor(doublet_type, levels = c("ISC*TCRab+ T cells", 
+                                                                     "ISCs*CD8+ TCRgd+ T cells", 
+                                                                     "Epithelial*TCRab+ T cells",
+                                                                     "Epithelial*CD4+ TCRab+ T cells", 
+                                                                     "Epithelial*CD8+ TCRab+ T cells", 
+                                                                     "Epithelial*CD8+ TCRgd+ T cells", 
+                                                                     "Epithelial*CD8- TCRgd+ T cells", 
+                                                                     "Epithelial*CD8+ TCRgd+ T cells*B cells", 
+                                                                     "CD324+ Epithelial*T cells"))), 
+             x = "group", y = "freq",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "doublet_type", jitter = 0.2, 
+             size = 6, add.params = list(color = "black"), shape = 21) + 
+  theme_classic() +
+  facet_wrap(~doublet_type, nrow = 2) +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5)
+print(p2)
+dev.off()
+
+# export source data 
+write_xlsx(p2$data, paste0(plot.dir, "source_data/Supplementary_Figure_5E_source_data.xlsx"))
+
+# stats for populations involving T cells 
+res %>% 
+    dplyr::filter(str_detect(doublet_type, "T cells"), 
+                  str_detect(doublet_type, "ISC|Epithelial")) %>% 
+  dplyr::group_by(group, doublet_type) %>% shapiro_test(freq) # don't assume normality 
+
+
+stats_pic_T <- res %>% 
+  dplyr::filter(str_detect(doublet_type, "T cells"), 
+                                   str_detect(doublet_type, "ISC|Epithelial")) %>% 
+  mutate(doublet_type = factor(doublet_type, levels = c("ISC*TCRab+ T cells", 
+                                                       "ISCs*CD8+ TCRgd+ T cells", 
+                                                       "Epithelial*TCRab+ T cells",
+                                                       "Epithelial*CD4+ TCRab+ T cells", 
+                                                       "Epithelial*CD8+ TCRab+ T cells", 
+                                                       "Epithelial*CD8+ TCRgd+ T cells", 
+                                                       "Epithelial*CD8- TCRgd+ T cells", 
+                                                       "Epithelial*CD8+ TCRgd+ T cells*B cells", 
+                                                       "CD324+ Epithelial*T cells"))) %>% 
+  group_by(doublet_type) %>% 
+  emmeans_test(freq ~ group) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% 
+  add_xy_position()
+```
+
+
+# export data set for publication 
+```{r}
+# overall landscape ------------------------------------------------------------
+overall_landscape <- obj_clean@meta.data %>% 
+  # remove unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, PeacoQC, Time,
+                   sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1,
+                   sketch_snn_res.2, seurat_clusters, sub.cluster))
+
+# export 
+write_csv(overall_landscape, file = paste0(data.dir, Sys.Date(), "_ISCs_overall_landscape.csv"), col_names = T, quote = "all")
+
+# interacting landscape --------------------------------------------------------
+dbts_export <- dbts_obj@meta.data %>% 
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, PeacoQC, Time,
+                   sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1,
+                   sketch_snn_res.2, seurat_clusters, sub.cluster,
+                   pred_snn_res.1, cluster_anno, celltype, FACS_snn_res.0.3, 
+                   FACS_snn_res.0.5, FACS_snn_res.1, FACS_snn_res.2, umap_1, umap_2)) %>% 
+  rename(prelim_type = doublet_type) 
+
+
+dbts_final <- dbts_obj_clean_sub@meta.data %>%
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, PeacoQC, Time,
+                   sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1,
+                   sketch_snn_res.2, seurat_clusters, pred_snn_res.1,
+                   celltype, FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1, 
+                   FACS_snn_res.2)) %>% 
+  rename(FACS_snn_res.2 = sub.cluster)
+
+# make sure all values except clustering, doublet type and umap_1/2 are the same 
+identical(dbts_export[rownames(dbts_final),c(1:33)], dbts_final[,c(1:33)]) # yes 
+
+# join
+interacting_landscape <- left_join(dbts_export, dbts_final)
+
+# export 
+write_csv(interacting_landscape, file = paste0(data.dir, Sys.Date(), "_ISCs_interacting_landscape.csv"), col_names = T, quote = "all")
+```
+
