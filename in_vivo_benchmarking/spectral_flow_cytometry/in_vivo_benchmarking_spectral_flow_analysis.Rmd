@@ -1,0 +1,1306 @@
+---
+title: "Data Analysis in vivo (LCMV) benchmarking"
+output: html_notebook
+author: "Viktoria Flore"
+date: "2024-07-08"
+---
+
+This is the analysis of the in vivo benchmarking spectral flow cytometry experiments 
+in Vonficht, Jopp-Saile, Yousefian, Flore et al. Ultra-high scale cytometry-based 
+cellular interaction mapping, Nature Methods (2025). Raw fcs files and pre-processed 
+csv files can be found on Zenodo at https://doi.org/10.5281/zenodo.10637096.
+
+# load packages and set paths 
+```{r results='hide', message=FALSE, warning=FALSE}
+library(stringr)
+library(Seurat)
+library(ggalluvial)
+library(ggpubr)
+library(viridis)
+library(clustree)
+library(ggpointdensity)
+library(plotly)
+library(sp)
+library(corrplot)
+library(PerformanceAnalytics)
+library(Hmisc)
+library(PICtR)
+library(writexl)
+library(readr)
+
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 2e9)
+
+dir <- "./in_vivo_benchmarking/spectral_flow_cytometry/"
+input.dir <- "./in_vivo_benchmarking/spectral_flow_cytometry/csv_files/"
+data.dir <- "./in_vivo_benchmarking/spectral_flow_cytometry/data/"
+plot.dir <- "./in_vivo_benchmarking/spectral_flow_cytometry/plots/"
+
+# create directory structure if not already present 
+for (d in c(input.dir, data.dir, plot.dir)) {
+  ifelse(!dir.exists(d), dir.create(d), FALSE)
+}
+```
+
+# load data
+```{r, message=FALSE, warning=FALSE}
+# find channel value csv files 
+files <- dir(paste0(input.dir), pattern="*.csv")
+
+message("reading data...")
+# read channel values and save in list
+file_list <- lapply(files, function(csv) {
+  # read csv
+  tab <- read.table(paste0(input.dir, csv), header = T, sep = ",")
+  # extract meta data
+  tab$sample <- csv
+  return(tab)
+})
+
+# combine into one dataframe
+data <- bind_rows(file_list)
+
+# formatting
+data <- data %>%
+  # add marker names
+  rename(AF = Comp.AF.A,
+         LD = LA,
+         aquisition_time = Time) %>%
+  mutate(well = str_extract(sample, "export_v2_(.*)\\s", group = 1)) %>%
+  mutate(experiment = if_else(well %in% c("A1", "A2", "A3", "A4",
+                                          "B1", "B2", "B3", "B4",
+                                          "E1", "E2", "E3",
+                                          "F1", "F2", "F3"), "unmixed_control", "mixed")) %>%
+  mutate(group = case_when(str_detect(well, "A") ~ "A",
+                           str_detect(well, "B") ~ "B",
+                           str_detect(well, "E") ~ "C",
+                           str_detect(well, "F") ~ "D",
+                           well %in% c("C1", "C2", "C3", "C4") ~ "A+C",
+                           well %in% c("C5", "C6", "C7", "C8") ~ "A+D",
+                           well %in% c("D1", "D2", "D3", "D4") ~ "B+C",
+                           well %in% c("D5", "D6", "D7", "D8") ~ "B+D",
+                           .default = NA)) %>%
+  mutate(condition = case_when(group == "A" ~ "infected",
+                               group == "B" ~ "control",
+                               group == "C" ~ "infected",
+                               group == "D" ~ "control",
+                               group == "A+C" ~ "infected+infected",
+                               group == "A+D" ~ "infected+control",
+                               group == "B+C" ~ "control+infected",
+                               group == "B+D" ~ "control+control"))
+
+# remove samples that included mouse A4. No CD90.1 cells present although they 
+# should have been transferred inthis group (and are visible for A1-A3)
+# maybe experimental error?   
+data <- data %>% 
+  dplyr::filter(!sample %in% c("export_v2_A4 4_Cells_live.csv", "export_v2_C4 12_Cells_live.csv", "export_v2_C8 16_Cells_live.csv")) 
+
+# sketching
+message("sketching...")
+obj <- sketch_wrapper(channel=data[,c(1,2,5,9,12:47)],
+                      meta_data=data,
+                      assay="FACS",
+                      FSC.A="FSC.A",
+                      FSC.H="FSC.H",
+                      n_sketch_cells=300000,
+                      resolution=c(0.3,0.5,1,2),
+                      obj_name="obj_sketched_non_projected",
+                      verbose=TRUE,
+                      BPcell_dir=NULL,
+                      ratio=TRUE,
+                      working_dir=data.dir)
+```
+
+# quality control
+```{r}
+# subset meta.data from sketched cells 
+sketched <- obj@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# check sketched contributions per well
+DefaultAssay(obj) <- "FACS"
+total <- length(Cells(obj))
+DefaultAssay(obj) <- "sketch"
+ 
+obj@meta.data %>% 
+  group_by(well) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+sketched %>% 
+  group_by(well) %>% 
+  count() %>% 
+  mutate(of_total = n / nrow(sketched)) # roughly same proportions, all good 
+
+# QC plots ----
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "02_qc/")), dir.create(paste0(plot.dir, "02_qc/")), FALSE)
+
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_condition.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "condition") 
+dev.off()
+
+# group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "group") 
+dev.off()
+
+# experiment 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_experiment.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "experiment") 
+dev.off()
+
+# well
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_well.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(obj, group.by = "well") 
+dev.off()
+
+# check area/height ratio distribution and cutoff
+cutoff <- calculateThreshold(hist(obj$ratio, breaks = 2000, plot = FALSE))
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_ratio_histogram.pdf"), height = 6, width = 8, onefile = T)
+hist(obj$ratio, breaks = 2000)
+abline(v=cutoff) # looks good 
+dev.off() 
+
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "03_annotation/")), dir.create(paste0(plot.dir, "03_annotation/")), FALSE)
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_feature_plots.pdf"), height = 7, width = 14, onefile = T)
+FeaturePlot(obj, features = colnames(obj@meta.data)[c(4,5,8,12,14:21)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj, features = colnames(obj@meta.data)[22:33], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj, features = colnames(obj@meta.data)[c(34:45)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(obj, features = colnames(obj@meta.data)[c(46:51,58)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+# RidgePlot
+features <- Features(obj)
+for (res in resolution) {
+  Idents(obj) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_ridgeplots_", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(obj, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+```
+
+# identify doublet clusters 
+```{r}
+# clustering resolutions
+resolution <- c("sketch_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "01_doublets/")), dir.create(paste0(plot.dir, "01_doublets/")), FALSE)
+
+# ratio cluster plots and preliminary selection of doublet clusters
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_ratio_cluster_plots_all_events.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  obj <- select_dbt(obj, clusters = res, selected_clusters = res)
+
+  # plots
+  print(ratio_cluster_plot(obj, clusters = res))
+}
+dev.off()
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_dimplot_clusters.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(obj, reduction = 'umap', group.by = res, label = T) + 
+          labs(title = paste0(res)))
+}
+dev.off()
+
+# clustree plot
+sketched <- obj@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+subset <- subset(obj, cells = rownames(sketched))
+
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_clustree_all_events.pdf"), height = 7, width = 14)
+clustree(subset, prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off()
+
+
+#####################
+##                 ##
+##     choose      ##
+##   resolution    ##
+##       1         ##
+##                 ##
+#####################
+
+# project chosen clustering to all cells
+obj <- predict_data(obj = obj,
+                    data_query = obj,
+                    ref_clusters = "sketch_snn_res.1",
+                    FSC.A="FSC.A",
+                    FSC.H="FSC.H",
+                    pred_name="pred_snn_res.1",
+                    chunk_size=1000000,
+                    assay_ref = "sketch",
+                    assay_query = "FACS")
+
+# ratio cluster plot for all projected cells
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_ratio_cluster_plots_all_cells_projected_res1.pdf"), height = 7, width = 14)
+ratio_cluster_plot(obj, clusters = "pred_snn_res.1", ratio = "ratio_anno", assay = "FACS")
+dev.off()
+
+# select doublet clusters
+obj <- select_dbt(obj, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.81) 
+
+# add meta.data
+dbts <- obj@misc$doublet_clusters_res.1_q0.81
+obj@meta.data <- obj@meta.data %>%
+  mutate(cluster_anno = if_else(condition = as.character(pred_snn_res.1) %in% dbts, true = "doublet_cluster", false = "singlet_cluster"))
+
+# save obj
+saveRDS(obj, file = paste0(data.dir, "obj_sketched_projected.rds"))
+
+# subset singlet clusters 
+sgl <- obj@meta.data %>% dplyr::filter(cluster_anno == "singlet_cluster")
+sgl <- subset(obj, cells = rownames(sgl))
+
+# save 
+saveRDS(sgl, file = paste0(data.dir, "sgl.rds"))
+
+# subset doublet clusters 
+dbts <- obj@meta.data %>% dplyr::filter(cluster_anno == "doublet_cluster")
+dbts <- subset(obj, cells = rownames(dbts))
+
+# save 
+saveRDS(dbts, file = paste0(data.dir, "dbts.rds"))
+```
+
+# singlet annotation 
+```{r}
+# load sgl data
+sgl <- readRDS(paste0(data.dir, "sgl.rds"))
+
+# default workflow to cluster
+DefaultAssay(sgl) <- "sketch"
+n_dims <- length(Features(sgl))
+sgl <- sgl %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs = n_dims - 1, approx = F) %>%
+  FindNeighbors(dims = 1:n_dims - 1) %>%
+  FindClusters(resolution = c(0.3, 0.5, 1, 2)) %>%
+  RunUMAP(dims = 1:n_dims - 1, return.model = TRUE)
+
+saveRDS(sgl, file = paste0(data.dir, "sgl_sketched.rds"))
+
+# plots
+resolution <- c("sketch_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+
+# dimplots grouped by cluster at each resolution
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_dimplot_clusters_sgl.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(sgl, reduction = 'umap', group.by = res, label = T) +
+          labs(title = paste0(res)))
+}
+dev.off()
+
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_condition_sgl.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(sgl, group.by = "condition")
+dev.off()
+
+# group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group_sgl.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(sgl, group.by = "group")
+dev.off()
+
+# experiment
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_experiment_sgl.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(sgl, group.by = "experiment")
+dev.off()
+
+# well
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_well_sgl.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(sgl, group.by = "well")
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_feature_plots_sgl.pdf"), height = 7, width = 14, onefile = T)
+FeaturePlot(sgl, features = colnames(sgl@meta.data)[c(4,5,8,12,14:21)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(sgl, features = colnames(sgl@meta.data)[22:33], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(sgl, features = colnames(sgl@meta.data)[c(34:45)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(sgl, features = colnames(sgl@meta.data)[c(46:51,58)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+# RidgePlot
+features <- Features(sgl)
+for (res in resolution) {
+  Idents(sgl) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_ridgeplots_", res, "_sgl.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(sgl, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# clustree
+sketched <- sgl@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+subset <- subset(sgl, cells = rownames(sketched))
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_clustree_sgl.pdf"), height = 7, width = 14)
+clustree(subset, prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off()
+
+
+##################
+##              ##
+##    choose    ##
+##  resolution  ##
+##     0.5      ##
+##              ##
+##################
+
+# check clustering for each cluster at resolution
+Idents(sgl) <- "sketch_snn_res.0.5"
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_dimplot_highlighted_clusters_res0.5_sgl.pdf"), height = 7, width = 9, onefile = T)
+for (i in (levels(sgl$sketch_snn_res.0.5) %>% as.numeric() %>% sort())) {
+  print(DimPlot(sgl, cells.highlight = WhichCells(sgl, idents = as.character(i))))
+}
+dev.off()
+
+# subcluster 10 
+Idents(sgl) <- "sketch_snn_res.0.5"
+sgl <- FindSubCluster(sgl, cluster = "5", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.05)
+Idents(sgl) <- "sub.cluster"
+sgl <- FindSubCluster(sgl, cluster = "10", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.05)
+Idents(sgl) <- "sub.cluster"
+sgl <- FindSubCluster(sgl, cluster = "21", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.05)
+Idents(sgl) <- "sub.cluster"
+sgl <- FindSubCluster(sgl, cluster = "27", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.03)
+
+
+DimPlot(sgl, group.by = "sub.cluster", label = T)
+
+features <- Features(sgl)
+Idents(sgl) <- "sub.cluster"
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_ridgeplots_subclustered_sgl.pdf"), height = 8, width = 5, onefile = T)
+for (f in features) {
+  print(RidgePlot(sgl, features = f, slot = 'data'))
+}
+dev.off()
+
+# predict
+# change subcluster names
+sgl@meta.data <- sgl@meta.data %>% mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", "."))
+
+sgl <- predict_data(obj = sgl,
+                     data_query = sgl,
+                     ref_clusters = "sub.cluster",
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_sgl_snn_res.0.5",
+                     chunk_size=1000000,
+                     assay_ref = "sketch",
+                     assay_query = "FACS")
+
+# save
+saveRDS(sgl, paste0(data.dir, "sgl_sketched_subclustered_projected.rds"))
+
+# annotation --------------------------------------------------------------------
+sgl@meta.data <- mutate(sgl@meta.data, celltype = case_when(
+  pred_sgl_snn_res.0.5 == "0" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "1" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "2" ~ "CD4 T cells",
+  pred_sgl_snn_res.0.5 == "3" ~ "CD8 T cells",
+  pred_sgl_snn_res.0.5 == "4" ~ "CD8 T cells",
+  pred_sgl_snn_res.0.5 == "5" ~ "Monocytes",
+  pred_sgl_snn_res.0.5 == "5.1" ~ "DCs",
+  pred_sgl_snn_res.0.5 == "6" ~ "CD8 T cells",
+  pred_sgl_snn_res.0.5 == "7" ~ "Plasmacells",
+  pred_sgl_snn_res.0.5 == "8" ~ "CD4 T cells",
+  pred_sgl_snn_res.0.5 == "9" ~ "CD8 T cells",
+  pred_sgl_snn_res.0.5 == "10" ~ "Neutrophils",
+  pred_sgl_snn_res.0.5 == "10.1" ~ "remove", 
+  pred_sgl_snn_res.0.5 == "11" ~ "Ag CD4 T cells",
+  pred_sgl_snn_res.0.5 == "12" ~ "Eosinophils",
+  pred_sgl_snn_res.0.5 == "13" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "14" ~ "DCs",
+  pred_sgl_snn_res.0.5 == "15" ~ "Macrophage-like",
+  pred_sgl_snn_res.0.5 == "16" ~ "NK cells",
+  pred_sgl_snn_res.0.5 == "17" ~ "Erythroids",
+  pred_sgl_snn_res.0.5 == "18" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "19" ~ "CD4 T cells",
+  pred_sgl_snn_res.0.5 == "20" ~ "NK cells",
+  pred_sgl_snn_res.0.5 == "21" ~ "Erythroids",
+  pred_sgl_snn_res.0.5 == "21.1" ~ "Erythroids",
+  pred_sgl_snn_res.0.5 == "21.2" ~ "remove", 
+  pred_sgl_snn_res.0.5 == "22" ~ "DCs",
+  pred_sgl_snn_res.0.5 == "23" ~ "gdT cells",
+  pred_sgl_snn_res.0.5 == "24" ~ "DCs",
+  pred_sgl_snn_res.0.5 == "25" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "26" ~ "pDCs",
+  pred_sgl_snn_res.0.5 == "27" ~ "Macrophage-like",
+  pred_sgl_snn_res.0.5 == "27.1" ~ "interacting cells",
+  pred_sgl_snn_res.0.5 == "27.2" ~ "interacting cells",
+  pred_sgl_snn_res.0.5 == "27.3" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "28" ~ "Basophils",
+  pred_sgl_snn_res.0.5 == "29" ~ "Granulocytes",
+  pred_sgl_snn_res.0.5 == "30" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "31" ~ "remove", # AF / compensation problem 
+  pred_sgl_snn_res.0.5 == "32" ~ "remove", # AF / compensation problem 
+  pred_sgl_snn_res.0.5 == "33" ~ "Myeloid", # CD11b
+  pred_sgl_snn_res.0.5 == "34" ~ "CD8 T cells",
+  pred_sgl_snn_res.0.5 == "35" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "36" ~ "remove", # AF / compensation problem 
+  pred_sgl_snn_res.0.5 == "37" ~ "remove",
+  pred_sgl_snn_res.0.5 == "38" ~ "B cells",
+  pred_sgl_snn_res.0.5 == "39" ~ "remove", # AF / compensation problem 
+  pred_sgl_snn_res.0.5 == "40" ~ "interacting cells",
+  pred_sgl_snn_res.0.5 == "41" ~ "B cells", 
+  pred_sgl_snn_res.0.5 == "42" ~ "remove", # AF / compensation problem 
+  pred_sgl_snn_res.0.5 == "43" ~ "CD8 T cells", 
+  pred_sgl_snn_res.0.5 == "44" ~ "remove", # unreasonable marker expression 
+  pred_sgl_snn_res.0.5 == "45" ~ "remove" # unreasonable marker expression (TCRyd, CD90.1+++, CD41)
+  ))
+
+DimPlot(sgl, group.by = "celltype", label =T)
+
+# save annotated obj
+saveRDS(sgl, paste0(data.dir, "sgl_sketched_subclustered_projected_annotated.rds"))
+
+# remove unidentifyable clusters 
+subset <- sgl@meta.data %>% dplyr::filter(!celltype %in% c("remove", "interacting cells"))
+sgl_clean <- subset(sgl, cells = rownames(subset))
+
+# re-calculate UMAP
+DefaultAssay(sgl_clean) <- "sketch"
+n_dims <- length(Features(sgl_clean))
+sgl_clean <- sgl_clean %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs = n_dims - 1, approx = F) %>%
+  FindNeighbors(dims = 1:n_dims - 1) %>%
+  RunUMAP(dims = 1:n_dims - 1, return.model = TRUE)
+
+sgl_clean$umap_1 <- sgl_clean@reductions$umap@cell.embeddings[,1]
+sgl_clean$umap_2 <- sgl_clean@reductions$umap@cell.embeddings[,2]
+
+# check CD45_1 vs CD45_2: since MCHII is too bright, more spreading error in any population that expresses MHCII
+sketched <- sgl_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+calculateThreshold(hist(sgl_clean$CD45_1, breaks = 2000))
+calculateThreshold(hist(sgl_clean$CD45_2, breaks = 2000))
+ggplot(sketched, aes(x = CD45_1, y = CD45_2)) + 
+    geom_point() +
+    facet_wrap(~celltype) + 
+  geom_vline(xintercept = 250) + 
+  geom_hline(yintercept = 375)
+
+# add to meta.data
+sgl_clean@meta.data <- sgl_clean@meta.data %>%
+  mutate(double_pos = if_else(CD45_1 >= 250 & CD45_2 >= 375, "double_positive", "single_positive")) # roughly 0.3 % of singlets are double-positive (mostly macrophage-like cells) - acceptable background 
+
+# save annotated obj
+saveRDS(sgl_clean, paste0(data.dir, "sgl_sketched_subclustered_projected_annotated_filtered.rds"))
+```
+
+# plot singlet object 
+```{r}
+sgl_clean <- readRDS(paste0(data.dir, "sgl_sketched_subclustered_projected_annotated_filtered.rds"))
+
+cols <- c("B cells" = "#12783D",    
+          "Ag CD4 T cells" = "#89CCED",     
+          "CD8 T cells" = "turquoise4",       
+          "CD4 T cells" = "#4B76BA",        
+          "gdT cells" = "#1FBAE8",          
+          "Plasmacells" = "palegreen",        
+          "NK cells" = "violetred3",           
+          "Neutrophils" = "gold1",        
+          "Granulocytes" = "#ED9B21",       
+          "Monocytes" = "#761F5F",          
+          "Basophils" = "khaki",          
+          "Erythroids" = "#8D3131",         
+          "DCs" = "thistle",                
+          "pDCs" = "lightslateblue",               
+          "Macrophage-like" = "#BF89BD",    
+          "Myeloid" = "#BA334D",   
+          "Eosinophils" = "wheat4")
+
+# UMAP 
+pdf(paste0(plot.dir, Sys.Date(), "_lcmv_benchmark_singlets_umap.pdf"), height = 7, width = 9)
+sgl_clean@meta.data %>% 
+  ggplot(aes(umap_1, umap_2, color = celltype)) + 
+  ggrastr::geom_point_rast(size = 0.2, color = "black", raster.dpi = 700) + 
+  ggrastr::geom_point_rast(aes(color = as.factor(celltype)), size = 0.05, raster.dpi = 700) + 
+  scale_color_manual(values = cols) + 
+  theme_classic() + 
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+dev.off()
+
+
+# feature plots for CD45_1, CD45_2
+pdf(paste0(plot.dir, Sys.Date(), "_lcmv_benchmark_singlets_CD45features.pdf"), height = 7, width = 4.5)
+p1 <- FeaturePlot(sgl_clean, features = c("CD45_1"), max.cutoff = 750) & scale_colour_gradientn(colours = pals::parula(1000)) 
+p2 <- FeaturePlot(sgl_clean, features = c("CD45_2"), max.cutoff = 750) & scale_colour_gradientn(colours = pals::parula(1000)) 
+ggarrange(p1, p2, nrow = 2)
+dev.off()
+```
+
+# PICs
+```{r}
+# add interacting cells left in singlet object back to dbts_obj ----
+subset <- sgl@meta.data %>% dplyr::filter(celltype == "interacting cells")
+int <- subset(sgl, cells = rownames(subset))
+
+DefaultAssay(dbts_obj) <- "FACS"
+DefaultAssay(int) <- "FACS"
+
+# merge 
+dbts_obj <- merge(dbts_obj, int)
+dbts_obj <- JoinLayers(dbts_obj)
+dbts_obj@assays$FACS$data <-dbts_obj@assays$FACS$counts
+
+dbts_obj[["sketch"]] <- NULL
+
+# save 
+saveRDS(dbts_obj, paste0(data.dir, "dbts.rds"))
+
+# clustering ---- 
+dbts_obj <- readRDS(paste0(data.dir, "dbts.rds"))
+
+DefaultAssay(dbts_obj) <- "FACS"
+message("Sketching started...")
+dbts_obj <- dbts_obj %>%
+  FindVariableFeatures() %>%
+  SketchData(ncells = 150000,
+             method = "LeverageScore",
+             sketched.assay = "sketch")
+
+# repeat seurat workflow
+DefaultAssay(dbts_obj) <- "sketch"
+resolution <- c(0.3, 0.5, 1, 2)
+n_dims <- Features(dbts_obj) %>% length()
+dbts_obj <- dbts_obj %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs=n_dims-1, approx=F, reduction.name = "pca_dbts") %>%
+  FindNeighbors(dims = 1:n_dims-1, reduction = "pca_dbts") %>%
+  FindClusters(resolution = resolution, graph.name = "sketch_snn") %>%
+  RunUMAP(dims = 1:n_dims-1, return.model = TRUE, reduction = "pca_dbts", reduction.name = "umap_dbts")
+
+# save obj
+saveRDS(dbts_obj, paste0(data.dir, "dbts_sketched.rds"))
+```
+
+# PIC annotation
+```{R}
+ifelse(!dir.exists(paste0(plot.dir, "04_doublet_annotation/")), dir.create(paste0(plot.dir, "04_doublet_annotation/")), FALSE)
+resolution <- c(0.3, 0.5, 1, 2)
+
+# plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_clusters_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_obj, reduction = 'umap_dbts', group.by = paste0("sketch_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_feature_plots_doublets.pdf"), height = 9, width = 14, onefile = T)
+FeaturePlot(dbts_obj, features = colnames(dbts_obj@meta.data)[c(4,5,8,12,14:21)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj, features = colnames(dbts_obj@meta.data)[22:33], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj, features = colnames(dbts_obj@meta.data)[c(34:45)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj, features = colnames(dbts_obj@meta.data)[c(46:51,58)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+# RidgePlots
+features <- Features(dbts_obj)
+for (res in resolution) {
+  Idents(dbts_obj) <- paste0("sketch_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_ridgeplots_", res, "_dbts_obj.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_obj, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_condition_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "condition")
+dev.off()
+
+# group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "group")
+dev.off()
+
+# experiment
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_experiment_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "experiment")
+dev.off()
+
+# well
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_well_dbts_obj.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj, group.by = "well")
+dev.off()
+
+# clustree
+sketched <- dbts_obj@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+subset <- subset(dbts_obj, cells = rownames(sketched))
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_clustree_dbts.pdf"), height = 7, width = 14)
+clustree(subset, prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off()
+
+
+#######################
+##     choose        ##
+##   resolution 0.5  ##
+##  and subcluster   ##
+#######################
+
+# check clustering solution with resolution = 0.5
+Idents(dbts_obj) <- "sketch_snn_res.0.5"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_highlighted_clusters_res0.5_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (i in as.numeric(levels(dbts_obj$sketch_snn_res.0.5)) %>% sort()) {
+  print(DimPlot(dbts_obj, cells.highlight = WhichCells(dbts_obj, idents = as.character(i))))
+}
+dev.off()
+
+# subcluster 4
+Idents(dbts_obj) <- "sketch_snn_res.0.5"
+dbts_obj <- FindSubCluster(dbts_obj, cluster = "4", graph.name = "sketch_snn", subcluster.name = "sub.cluster", resolution = 0.07)
+Idents(dbts_obj) <- "sub.cluster"
+dbts_obj <- FindSubCluster(dbts_obj, cluster = "18", graph.name = "sketch_snn", subcluster.name = "sub.cluster", resolution = 0.05)
+Idents(dbts_obj) <- "sub.cluster"
+dbts_obj <- FindSubCluster(dbts_obj, cluster = "21", graph.name = "sketch_snn", subcluster.name = "sub.cluster", resolution = 0.02)
+
+DimPlot(dbts_obj, group.by = "sub.cluster", label = T)
+
+# predict
+dbts_obj@meta.data <- dbts_obj@meta.data %>% mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", "."))
+dbts_obj <- predict_data(obj = dbts_obj,
+                     data_query = dbts_obj,
+                     ref_clusters = "sub.cluster",
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_snn_res.0.5",
+                     chunk_size=1000000,
+                     assay_ref = "sketch",
+                     assay_query = "FACS")
+
+# save
+saveRDS(dbts_obj, paste0(data.dir, "dbts_sketched_projected.rds"))
+
+# annotation ----
+dbts_obj@meta.data <- mutate(dbts_obj@meta.data, doublet_type = case_when(
+  pred_snn_res.0.5 == "0"~ "B",
+  pred_snn_res.0.5 == "1"~ "B*CD8",
+  pred_snn_res.0.5 == "2"~ "B",
+  pred_snn_res.0.5 == "3"~ "B",
+  pred_snn_res.0.5 == "4"~ "CD8*pDC",
+  pred_snn_res.0.5 == "4.1"~ "pDC*x",
+  pred_snn_res.0.5 == "5"~ "CD4*CD8",
+  pred_snn_res.0.5 == "6"~ "B*CD4",
+  pred_snn_res.0.5 == "7"~ "T*DC",
+  pred_snn_res.0.5 == "8"~ "CD8*DC",
+  pred_snn_res.0.5 == "9"~ "B*CD4",
+  pred_snn_res.0.5 == "10"~ "B*My",
+  pred_snn_res.0.5 == "11"~ "B*Granulo",
+  pred_snn_res.0.5 == "12"~ "Mono*x",
+  pred_snn_res.0.5 == "13"~ "Ag CD4*B",
+  pred_snn_res.0.5 == "14"~ "Ag CD4*CD8",
+  pred_snn_res.0.5 == "15"~ "Granulo*T",
+  pred_snn_res.0.5 == "16"~ "remove", # compensation issue
+  pred_snn_res.0.5 == "17"~ "T*My",
+  pred_snn_res.0.5 == "18"~ "B*NK",
+  pred_snn_res.0.5 == "18.1"~ "B*gdT",
+  pred_snn_res.0.5 == "18.2"~ "B*NK",
+  pred_snn_res.0.5 == "19"~ "B*DC?",
+  pred_snn_res.0.5 == "20"~ "CD4*DC?",
+  pred_snn_res.0.5 == "21"~ "B*pDC",
+  pred_snn_res.0.5 == "21.1"~ "CD4*CD8",
+  pred_snn_res.0.5 == "22"~ "gdT*T",
+  pred_snn_res.0.5 == "23"~ "B",
+  pred_snn_res.0.5 == "24"~ "remove",
+  pred_snn_res.0.5 == "25"~ "remove",
+  pred_snn_res.0.5 == "26"~ "B",
+  pred_snn_res.0.5 == "27"~ "remove",
+  pred_snn_res.0.5 == "28"~ "remove"
+))
+
+DimPlot(dbts_obj, group.by = "doublet_type", label = T)
+
+# save annotated obj
+saveRDS(dbts_obj, paste0(data.dir, "dbts_sketched_projected_annotated.rds"))
+```
+
+# clean doublet anno 
+```{R}
+# remove homotypic / low quality samples
+subset <- dbts_obj@meta.data %>%
+  dplyr::filter(!doublet_type %in% c("remove", "B"))
+
+dbts_obj_clean <- subset(dbts_obj, cells = rownames(subset))
+
+# remove old meta data and reductions
+dbts_obj_clean@meta.data <- dbts_obj_clean@meta.data %>%
+  select(-c(sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1, sketch_snn_res.2, doublet_type, umap_1, umap_2, seurat_clusters))
+
+dbts_obj_clean@reductions$umap <- NULL
+dbts_obj_clean@reductions$pca <- NULL
+
+# repeat Seurat workflow
+resolution <- c(0.5, 1, 2, 3)
+n_dims <- Features(dbts_obj_clean) %>% length()
+dbts_obj_clean <- dbts_obj_clean %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>%
+    RunPCA(npcs=n_dims-1, approx=F) %>%
+    FindNeighbors(dims = 1:n_dims-1) %>%
+    FindClusters(resolution = resolution) %>%
+    RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save filtered data
+saveRDS(dbts_obj_clean, paste0(data.dir, "dbts_sketched_projected_filtered.rds"))
+
+# plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_clusters_doublets_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_obj_clean, group.by = paste0("sketch_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_feature_plots_doublets_clean.pdf"), height = 9, width = 14, onefile = T)
+FeaturePlot(dbts_obj_clean, features = colnames(dbts_obj_clean@meta.data)[c(4,5,8,12,14:21)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj_clean, features = colnames(dbts_obj_clean@meta.data)[22:33], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj_clean, features = colnames(dbts_obj_clean@meta.data)[c(34:45)], slot = "counts") & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_obj_clean, features = colnames(dbts_obj_clean@meta.data)[c(46:51,58)], slot = "counts") & scale_color_viridis(option = 'magma')
+dev.off()
+
+# RidgePlots
+features <- Features(dbts_obj_clean)
+for (res in resolution) {
+  Idents(dbts_obj_clean) <- paste0("sketch_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_ridgeplots_", res, "_dbts_obj_clean.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_obj_clean, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_condition_dbts_obj_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean, group.by = "condition")
+dev.off()
+
+# group
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_group_dbts_obj_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean, group.by = "group")
+dev.off()
+
+# experiment
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_experiment_dbts_obj_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean, group.by = "experiment")
+dev.off()
+
+# well
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_well_dbts_obj_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(dbts_obj_clean, group.by = "well")
+dev.off()
+
+# clustree
+sketched <- dbts_obj_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+subset <- subset(dbts_obj_clean, cells = rownames(sketched))
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_clustree_dbts_clean.pdf"), height = 7, width = 14)
+clustree(subset, prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off()
+
+#######################
+##     choose        ##
+##   resolution 1    ##
+##  and subcluster   ##
+#######################
+
+# double-positive interactions often cluster together with single-positive, gate manually 
+# (preliminary, repeat population-specific later):
+calculateThreshold(hist(dbts_obj_clean$CD45_1, breaks = 2000))
+calculateThreshold(hist(dbts_obj_clean$CD45_2, breaks = 2000))
+ggplot(dbts_obj_clean@meta.data, aes(x = CD45_1, y = CD45_2)) +
+  geom_point() +
+  geom_vline(xintercept = 250) +
+  geom_hline(yintercept = 375) 
+
+# add to meta.data
+dbts_obj_clean@meta.data <- dbts_obj_clean@meta.data %>%
+  mutate(double_pos = if_else(CD45_1 >= 250 & CD45_2 >= 375, "double_positive", "single_positive"))
+
+# dimplot
+DimPlot(dbts_obj_clean, group.by = "double_pos")
+
+Idents(dbts_obj_clean) <- "sketch_snn_res.1"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_highlighted_clusters_res1_doublets_clean.pdf"), height = 7, width = 9, onefile = T)
+for (i in as.numeric(levels(dbts_obj_clean$sketch_snn_res.1)) %>% sort()) {
+  print(DimPlot(dbts_obj_clean, cells.highlight = WhichCells(dbts_obj_clean, idents = as.character(i))))
+}
+dev.off()
+
+# subcluster 
+Idents(dbts_obj_clean) <- "sketch_snn_res.1"
+dbts_obj_clean <- FindSubCluster(dbts_obj_clean, cluster = "17", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.3)
+Idents(dbts_obj_clean) <- "sub.cluster"
+dbts_obj_clean <- FindSubCluster(dbts_obj_clean, cluster = "30", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.2)
+Idents(dbts_obj_clean) <- "sub.cluster"
+dbts_obj_clean <- FindSubCluster(dbts_obj_clean, cluster = "32", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.1)
+Idents(dbts_obj_clean) <- "sub.cluster"
+dbts_obj_clean <- FindSubCluster(dbts_obj_clean, cluster = "9", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.1)
+Idents(dbts_obj_clean) <- "sub.cluster"
+dbts_obj_clean <- FindSubCluster(dbts_obj_clean, cluster = "2", subcluster.name = "sub.cluster", graph.name = "sketch_snn", resolution = 0.075)
+
+DimPlot(dbts_obj_clean, group.by = "sub.cluster", label = T)
+
+# prediction -----
+dbts_obj_clean@meta.data <- dbts_obj_clean@meta.data %>% 
+  mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", ".")) %>% 
+  mutate(sub.cluster = factor(sub.cluster))
+dbts_obj_clean <- predict_data(obj = dbts_obj_clean,
+                     data_query = dbts_obj_clean,
+                     ref_clusters = "sub.cluster",
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_snn_res.1",
+                     chunk_size=1000000,
+                     assay_ref = "sketch",
+                     assay_query = "FACS")
+
+# subclustered ridge plot 
+features <- Features(dbts_obj_clean)
+Idents(dbts_obj_clean) <- "sub.cluster"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_ridgeplots_subclustered_dbts_obj_clean.pdf"), height = 8, width = 5, onefile = T)
+for (f in features) {
+  print(RidgePlot(dbts_obj_clean, features = f, slot = 'data'))
+}
+dev.off()
+
+# annotation ----
+dbts_obj_clean@meta.data <- mutate(dbts_obj_clean@meta.data, doublet_type = case_when(
+  pred_snn_res.1 == "0"~ "CD8*PC",
+  pred_snn_res.1 == "1"~ "B*CD8",
+  pred_snn_res.1 == "2"~ "T*DC",
+  pred_snn_res.1 == "2.1"~ "CD4*Mono",
+  pred_snn_res.1 == "3"~ "B*CD4",
+  pred_snn_res.1 == "4"~ "B*CD4",
+  pred_snn_res.1 == "5"~ "CD4*CD8",
+  pred_snn_res.1 == "6"~ "CD8*Mono",
+  pred_snn_res.1 == "7"~ "B*CD8",
+  pred_snn_res.1 == "8"~ "B*Neutro",
+  pred_snn_res.1 == "9"~ "Ag CD4*CD8",
+  pred_snn_res.1 == "9.1"~ "Ag CD4*My",
+  pred_snn_res.1 == "10"~ "B*Mono",
+  pred_snn_res.1 == "11"~ "CD8*DC",
+  pred_snn_res.1 == "12"~ "Misc*Neutro",
+  pred_snn_res.1 == "13"~ "B*CD8",
+  pred_snn_res.1 == "14"~ "CD8*DC",
+  pred_snn_res.1 == "15"~ "Ag CD4*B",
+  pred_snn_res.1 == "16"~ "CD4*CD8",
+  pred_snn_res.1 == "17"~ "PC*pDC",
+  pred_snn_res.1 == "17.1"~ "PC*pDC",
+  pred_snn_res.1 == "17.2"~ "PC*pDC",
+  pred_snn_res.1 == "17.3"~ "PC*My",
+  pred_snn_res.1 == "18"~ "B*DC",
+  pred_snn_res.1 == "19"~ "B*CD8",
+  pred_snn_res.1 == "20"~ "B*CD4",
+  pred_snn_res.1 == "21"~ "CD4*PC",
+  pred_snn_res.1 == "22"~ "B*NK",
+  pred_snn_res.1 == "23"~ "B*DC",
+  pred_snn_res.1 == "24"~ "B*Granulo",
+  pred_snn_res.1 == "25"~ "Ag CD4*PC",
+  pred_snn_res.1 == "26"~ "NK*T",
+  pred_snn_res.1 == "27"~ "Granulo*T",
+  pred_snn_res.1 == "28"~ "B*pDC",
+  pred_snn_res.1 == "29"~ "gdT*T",
+  pred_snn_res.1 == "30"~ "B*gdT",
+  pred_snn_res.1 == "30.1"~ "B*gdT",
+  pred_snn_res.1 == "30.2"~ "B*gdT",
+  pred_snn_res.1 == "31"~ "CD4*pDC",
+  pred_snn_res.1 == "32"~ "CD4*Granulo",
+  pred_snn_res.1 == "32.1"~ "Ag CD4*Granulo",
+  pred_snn_res.1 == "33"~ "DC*Macropage-like",
+  pred_snn_res.1 == "34"~ "pDC*Macropage-like",
+  pred_snn_res.1 == "35"~ "remove",
+  pred_snn_res.1 == "36"~ "B*NK", 
+  pred_snn_res.1 == "37"~ "remove"
+))
+
+# overview annotation
+DimPlot(dbts_obj_clean, group.by = "doublet_type", label = T)
+
+# remove remaining low quality clusters and re-calculate UMAP 
+subset <- dbts_obj_clean@meta.data %>% dplyr::filter(doublet_type != "remove")
+dbts_obj_clean <- subset(dbts_obj_clean, cells = rownames(subset))
+
+# re-calculate UMAP
+DefaultAssay(dbts_obj_clean) <- "sketch"
+n_dims <- length(Features(dbts_obj_clean))
+dbts_obj_clean <- dbts_obj_clean %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs = n_dims - 1, approx = F) %>%
+  FindNeighbors(dims = 1:n_dims - 1) %>%
+  RunUMAP(dims = 1:n_dims - 1, return.model = TRUE)
+
+dbts_obj_clean$umap_1 <- dbts_obj_clean@reductions$umap@cell.embeddings[,1]
+dbts_obj_clean$umap_2 <- dbts_obj_clean@reductions$umap@cell.embeddings[,2]
+
+# save
+saveRDS(dbts_obj_clean, paste0(data.dir, "dbts_sketched_projected_filtered_annotated.rds"))
+```
+
+# plot doublets
+```{R}
+# UMAP
+cols <- c("B*CD4" = "#BCE6B1",            
+          "B*CD8" = "#81BADA",               
+          "Ag CD4*B" = "#004529",            
+          "Ag CD4*CD8" = "#238443",          
+          "CD8*PC" = "#3787C0",              
+          "PC*pDC" = "palevioletred1",              
+          "B*Granulo" = "#9151A4",           
+          "B*Neutro" = "#A28BBB",           
+          "CD8*DC" = "#96A5D4",              
+          "CD4*Mono" = "#ECE190",            
+          "B*Mono" = "#C36FB1",              
+          "CD4*CD8" = "#3BA455",             
+          "Misc*Neutro" = "#F5BA3D",         
+          "B*NK" = "#A4435F",                
+          "CD8*Mono" = "#85AB70",            
+          "Ag CD4*Granulo" = "#ADDD8E",      
+          "CD4*PC" = "#18482F",             
+          "Ag CD4*PC" = "#7BBCB0",           
+          "Granulo*T" = "#EA7E73",           
+          "NK*T" = "#BF5268",                
+          "B*DC" = "#E34699",                
+          "Ag CD4*My" = "#F7FCB9",           
+          "CD4*pDC" = "palegreen2",             
+          "T*DC" = "steelblue",                
+          "PC*My" = "#C42B79",               
+          "CD4*Granulo" = "#FFDD00",         
+          "gdT*T" = "dodgerblue3",               
+          "B*gdT" = "#08306B",               
+          "B*pDC" = "#E597B9",               
+          "DC*Macropage-like" = "orchid2",   
+          "pDC*Macropage-like" = "mediumpurple2")
+
+# plot
+pdf(paste0(plot.dir, Sys.Date(), "_lcmv_benchmark_doublets_umap.pdf"), height = 7, width = 9)
+dbts_obj_clean@meta.data %>% 
+  ggplot(aes(umap_1, umap_2, color = doublet_type)) + 
+  ggrastr::geom_point_rast(size = 0.2, color = "black", raster.dpi = 700) + 
+  ggrastr::geom_point_rast(aes(color = as.factor(doublet_type)), size = 0.05, raster.dpi = 700) + 
+  scale_color_manual(values = cols) + 
+  theme_classic() + 
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+dev.off()
+
+# feature plots CD45_1, CD45_2
+pdf(paste0(plot.dir, Sys.Date(), "_lcmv_benchmark_doublets_CD45features.pdf"), height = 7, width = 4.5)
+p1 <- FeaturePlot(dbts_obj_clean, features = c("CD45_1"), max.cutoff = 750) & scale_colour_gradientn(colours = pals::parula(1000)) 
+p2 <- FeaturePlot(dbts_obj_clean, features = c("CD45_2"), max.cutoff = 750) & scale_colour_gradientn(colours = pals::parula(1000)) 
+ggarrange(p1, p2, nrow = 2)
+dev.off()
+
+# dot plot CD45.1 vs CD45.2 
+pdf(paste0(plot.dir, Sys.Date(), "_lcmv_benchmark_doublets_CD45_dotplot.pdf"), height = 7, width = 8)
+ggplot(dbts_obj_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters)) %>% dplyr::filter(condition %in% c("control", "infected", "control+control", "infected+infected")), 
+       aes(x = CD45_2, y = CD45_1, color = double_pos)) + 
+  geom_point() + 
+  facet_wrap(~condition) + 
+  scale_color_manual(values = c("#75BE7D", "#343DAE")) + 
+  theme_classic() 
+dev.off()
+```
+
+# double-positive interacting cells +/- cytostim 
+```{r}
+# check CD45_1 / CD45_2 expression by interaction type ----
+sketched <- dbts_obj_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+ggplot(sketched %>% dplyr::filter(experiment == "unmixed_control"), aes(x = CD45_1, y = CD45_2, color = double_pos)) +
+  geom_point() + 
+  geom_vline(xintercept = 250) +
+  geom_hline(yintercept = 375) +
+  facet_wrap(~doublet_type) # -> different background, adapt on a population basis 
+
+# population-specific double-positive cutoffs
+dbts_obj_clean@meta.data <- dbts_obj_clean@meta.data %>% mutate(double_pos = case_when(
+  str_detect(doublet_type, "Ag") & CD45_1 >= 200 & CD45_2 >= 250 ~ "double_positive",
+  doublet_type %in% c("B*CD4",
+                      "B*CD8", 
+                      "B*DC", 
+                      "B*Granulo",
+                      "B*Neutro",
+                      "B*gdT",
+                      "B*pDC", 
+                      "B*NK") & CD45_1 >= 250 & CD45_2 >= 250 ~ "double_positive", 
+  doublet_type == "B*Mono" & CD45_1 >= 225 & CD45_2 >= 300 ~ "double_positive", 
+  str_detect(doublet_type, "^CD4") & CD45_1 >= 200 & CD45_2 >= 250 ~ "double_positive", 
+  str_detect(doublet_type, "^CD8") & CD45_1 >= 225 & CD45_2 >= 250 ~ "double_positive", 
+  str_detect(doublet_type, "Macro") & CD45_1 >= 200 & CD45_2 >= 250 ~ "double_positive", 
+  doublet_type == "Granulo*T" & CD45_1 >= 200 & CD45_2 >= 225 ~ "double_positive", 
+  doublet_type == "Misc*Neutro" & CD45_1 >= 250 & CD45_2 >= 250 ~ "double_positive", 
+  doublet_type == "NK*T" & CD45_1 >= 150 & CD45_2 >= 225 ~ "double_positive", 
+  str_detect(doublet_type, "^PC") & CD45_1 >= 250 & CD45_2 >= 250 ~  "double_positive", 
+  doublet_type == "T*DC" & CD45_1 >= 250 & CD45_2 >= 275 ~ "double_positive", 
+  doublet_type == "gdT*T" & CD45_1 >= 150 & CD45_2 >= 225 ~ "double_positive", 
+  .default = "single_positive"))
+
+# plot by population
+sketched <- dbts_obj_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+ggplot(sketched, aes(x = CD45_1, y = CD45_2, color = double_pos)) +
+    geom_point() + 
+    facet_wrap(~doublet_type)
+
+con <- c("infected", "control", "infected+infected", "control+control")
+plots = vector('list', length(con))
+for(i in seq_along(con)){
+  plots[[i]] = ggplot(sketched %>% dplyr::filter(condition == con[i]), aes(x = CD45_1, y = CD45_2, color = double_pos)) +
+    geom_point() + 
+    facet_wrap(~doublet_type) + 
+    labs(title = con[i])
+}
+ggarrange(plotlist = plots)
+
+# quantification -----
+# live, high quality event counts
+live_sgl <- sgl@meta.data %>%
+  dplyr::filter(!celltype %in% c("remove", "interacting cells")) %>%
+  group_by(sample) %>%
+  count(name = "live")
+
+live_dbts <- dbts_obj@meta.data %>% 
+  dplyr::filter(!celltype %in% c("remove")) %>%
+  group_by(sample) %>%
+  count(name = "live_dbts")
+
+live <- left_join(live_sgl, live_dbts, by = "sample") %>% 
+  mutate(total = live + live_dbts)
+
+# add the meta.data
+dbts <- dbts_obj_clean
+dbts@meta.data <- left_join(dbts_obj_clean@meta.data, live, by = "sample")
+
+# mix ----
+mixed <- dbts@meta.data %>%
+  dplyr::filter(doublet_type != "remove") %>% 
+  mutate(doublet_type = factor(doublet_type, levels = unique(doublet_type))) %>%
+  mutate(double_pos = factor(double_pos, levels = c("double_positive", "single_positive"))) %>%
+  mutate(sample = factor(sample, levels = unique(sample))) %>%
+  group_by(doublet_type, double_pos, sample, .drop = F) %>%
+  count()
+
+# and info about groups and total live cells
+mixed <- left_join(mixed, (dbts@meta.data %>% group_by(sample, group, experiment, condition, live) %>% summarize()), by = "sample")
+
+# and pseudocount to circumvent dividing by 0 and calculate frequency
+mixed <- mixed %>%
+  mutate(pseudocount = 1) %>% 
+  mutate(n = n+pseudocount) %>%
+  mutate(freq = n / live) %>%
+  mutate(group = factor(group, levels = c("A", "B", "C", "D", "A+C", "A+D", "B+C", "B+D")))
+```
+
+# correlation mixed/unmixed 
+```{r}
+data <- mixed %>% dplyr::filter(group %in% c("A", "B", "A+C", "B+D")) # remove cross-condition mix
+
+ctrl_sing_pos <- data %>% 
+  dplyr::filter(str_detect(condition, "control"), # only control condition
+                double_pos == "single_positive") %>%  # only single positive events 
+  mutate(uniqID = str_c(group, doublet_type, double_pos, sep = "_")) %>%
+  mutate(mergeID = str_c(experiment, doublet_type, double_pos, sep = "_")) %>%
+  group_by(uniqID, mergeID) %>% 
+  summarize(ctrl_mean = mean(freq))
+
+ctrl_db_pos <- data %>% 
+  dplyr::filter(condition == "control+control", # only control condition from mixed samples 
+                double_pos == "double_positive") %>%  # only double positive events 
+  mutate(uniqID = str_c(group, doublet_type, double_pos, sep = "_")) %>%
+  mutate(mergeID = str_c(experiment, doublet_type, double_pos, sep = "_")) %>%
+  group_by(uniqID, mergeID) %>% 
+  summarize(ctrl_mean = mean(freq))
+
+ctrl <- rbind(ctrl_sing_pos, ctrl_db_pos) 
+
+# fold change
+data <- data %>%
+  mutate(uniqID = str_c(group, doublet_type, double_pos, sep = "_")) %>%
+  mutate(mergeID = str_c(experiment, doublet_type, double_pos, sep = "_")) %>%
+  left_join(ctrl, by = "mergeID") %>%
+  dplyr::filter(!(experiment == "unmixed_control" & double_pos == "double_positive")) %>% 
+  mutate(FC = freq / ctrl_mean) %>% 
+  mutate(log2FC = log2(FC))
+
+# together in one graph, concatenate experiment and double_pos to split error bars correctly 
+# fix colors
+cols2 <- cols
+cols3 <- cols
+names(cols) <- paste0(names(cols), "_single_positive_unmixed_control")
+names(cols2) <- paste0(names(cols2), "_single_positive_mixed")
+names(cols3) <- paste0(names(cols3), "_double_positive_mixed")
+
+cols_all <- c(cols, cols2, cols3)
+
+# sort by decreasing Log2FC
+pdf(paste0(plot.dir, Sys.Date(), "_lcmv_benchmark_log2FC_all_doublet_types.pdf"), height = 7, width = 15)
+levels <- (data %>% dplyr::filter(!str_detect(condition, "control"), experiment == "unmixed_control") %>% group_by(doublet_type, double_pos, experiment) %>% mutate(mean = mean(log2FC)) %>% arrange(desc(mean)))$doublet_type %>% unique()
+p <- ggbarplot(data %>% 
+            dplyr::filter(!str_detect(condition, "control")) %>% 
+            mutate(measurement = factor(str_c(double_pos, experiment, sep = "_"), 
+                                        levels = c("single_positive_unmixed_control", "single_positive_mixed", "double_positive_mixed"))) %>% 
+            mutate(doublet_type = factor(doublet_type, levels = levels)) %>% 
+            mutate(colours = factor(str_c(doublet_type, measurement, sep = "_"))) %>% 
+            mutate(colours = factor(colours), levels = unique(colours) %>% as.character() %>% sort(decreasing = T)),
+          x = "doublet_type", y = "log2FC", fill = "colours", 
+          position = position_dodge(0.9), add = "mean_sd") + 
+  ylim(-7,11) + 
+  scale_fill_manual(values = cols_all) + 
+  geom_hline(yintercept = 0) + 
+  theme(axis.text.x = element_text(angle = 90), legend.position = "none")
+print(p)
+dev.off()
+
+# export source data 
+write_xlsx(p$data, paste0(plot.dir, "Supplementary_Figure_3F_source_data.xlsx"))
+
+# correlations ---- 
+cor <- data %>% dplyr::filter(!str_detect(condition, "control")) %>% 
+  mutate(mouse = case_when(
+    str_detect(sample, "A1") ~ "A1", 
+    str_detect(sample, "A2") ~ "A2", 
+    str_detect(sample, "A3") ~ "A3", 
+    str_detect(sample, "C1") ~ "A1", 
+    str_detect(sample, "C2") ~ "A2", 
+    str_detect(sample, "C3") ~ "A3")) %>%
+  mutate(mouse_type = str_c(mouse, doublet_type, sep = "_")) %>% 
+  mutate(measurement = str_c(double_pos, experiment, sep = "_")) %>% 
+  tidyr::pivot_wider(names_from = measurement, values_from = log2FC) %>% 
+  ungroup() %>% 
+  select(c(single_positive_unmixed_control, single_positive_mixed, double_positive_mixed, mouse_type)) %>% 
+  group_by(mouse_type) %>% 
+  summarise(across(1:3, ~ first(na.omit(.)))) %>%
+  ungroup() 
+
+# correlation plot 
+cor_p <- rcorr(as.matrix(cor %>% tibble::column_to_rownames(var = "mouse_type")), type = "pearson")
+corrplot(cor_p$r, method = "circle", type = "upper", p.mat = cor_p$P, 
+         insig = "label_sig", sig.level = c(0.0001, 0.001, 0.01, 0.05), pch.cex = 0.9, pch.col = "white", tl.col = "black")
+
+# linear 
+lin <- cor %>% 
+  mutate(mouse = str_extract(mouse_type, "^A[0-9]")) %>% 
+  mutate(doublet_type = str_extract(mouse_type, "^A[0-9]_(.*)", group = 1))
+
+cols <- c("B*CD4" = "#BCE6B1",            
+          "B*CD8" = "#81BADA",               
+          "Ag CD4*B" = "#004529",            
+          "Ag CD4*CD8" = "#238443",          
+          "CD8*PC" = "#3787C0",              
+          "PC*pDC" = "palevioletred1",              
+          "B*Granulo" = "#9151A4",           
+          "B*Neutro" = "#A28BBB",           
+          "CD8*DC" = "#96A5D4",              
+          "CD4*Mono" = "#ECE190",            
+          "B*Mono" = "#C36FB1",              
+          "CD4*CD8" = "#3BA455",             
+          "Misc*Neutro" = "#F5BA3D",         
+          "B*NK" = "#A4435F",                
+          "CD8*Mono" = "#85AB70",            
+          "Ag CD4*Granulo" = "#ADDD8E",      
+          "CD4*PC" = "#18482F",             
+          "Ag CD4*PC" = "#7BBCB0",           
+          "Granulo*T" = "#EA7E73",           
+          "NK*T" = "#BF5268",                
+          "B*DC" = "#E34699",                
+          "Ag CD4*My" = "#F7FCB9",           
+          "CD4*pDC" = "palegreen2",             
+          "T*DC" = "steelblue",                
+          "PC*My" = "#C42B79",               
+          "CD4*Granulo" = "#FFDD00",         
+          "gdT*T" = "dodgerblue3",               
+          "B*gdT" = "#08306B",               
+          "B*pDC" = "#E597B9",               
+          "DC*Macropage-like" = "orchid2",   
+          "pDC*Macropage-like" = "mediumpurple2")
+
+p1 <- ggplot(lin, aes(x = single_positive_unmixed_control, y = single_positive_mixed)) +
+  geom_point(aes(shape = mouse), color = "black", size = 4) + 
+    geom_point(aes(shape = mouse, color = doublet_type), size = 3) + 
+    geom_smooth(method = "lm", color = "black") + scale_color_manual(values = cols) + 
+    theme_classic() + theme(legend.position = "none") + xlim(-7,11) + ylim(-7,11)
+p2 <- ggplot(lin, aes(x = single_positive_unmixed_control, y = double_positive_mixed)) + 
+  geom_point(aes(shape = mouse), color = "black", size = 4) + 
+    geom_point(aes(shape = mouse, color = doublet_type), size = 3) + 
+    geom_smooth(method = "lm", color = "black") + scale_color_manual(values = cols) + 
+    theme_classic() + theme(legend.position = "none") + xlim(-7,11) + ylim(-7,11)
+p3 <- ggplot(lin, aes(x = single_positive_mixed, y = double_positive_mixed)) + 
+  geom_point(aes(shape = mouse), color = "black", size = 4) + 
+    geom_point(aes(shape = mouse, color = doublet_type), size = 3) + 
+    geom_smooth(method = "lm", color = "black") + scale_color_manual(values = cols) + 
+    theme_classic() + theme(legend.position = "none") + xlim(-7,11) + ylim(-7,11)
+
+pdf(paste0(plot.dir, Sys.Date(), "_doublevssinglepositive_correlations_lm.pdf"), height = 5, width = 15)
+ggarrange(p1, p2, p3, nrow = 1)
+dev.off()
+
+# export source data 
+write_xlsx(p1$data, paste0(plot.dir, "Supplementary_Figure_3G_source_data_left.xlsx"))
+write_xlsx(p2$data, paste0(plot.dir, "Supplementary_Figure_3G_source_data_middle.xlsx"))
+write_xlsx(p3$data, paste0(plot.dir, "Supplementary_Figure_3G_source_data_right.xlsx"))
+
+# linear regression stats 
+summary(lm(single_positive_mixed ~ single_positive_unmixed_control, data = lin))
+summary(lm(double_positive_mixed ~ single_positive_unmixed_control, data = lin))
+summary(lm(double_positive_mixed ~ single_positive_mixed, data = lin))
+```
+
+# export datasets 
+```{r}
+# overall landscape ------------------------------------------------------------
+# add gating info to obj 
+overall_landscape <- sgl_clean@meta.data %>% 
+  # remove unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, FSC.A...FSC.H, LD,
+                   aquisition_time, sketch_snn_res.0.3, sketch_snn_res.0.5,
+                   sketch_snn_res.1, sketch_snn_res.2, seurat_clusters, 
+                   pred_snn_res.1, sub.cluster)) %>% 
+  rename(cluster = pred_sgl_snn_res.0.5)
+
+# export 
+write_csv(overall_landscape, file = paste0(data.dir, Sys.Date(), "_in_vivo_lcmv_benchmarking_overall_landscape.csv"), col_names = T, quote = "all")
+
+# interacting landscape --------------------------------------------------------
+dbts_export <- dbts_obj@meta.data %>% 
+  # remove only low quality events, keep homotypic interactions
+  dplyr::filter(!doublet_type == "remove") %>% 
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, FSC.A...FSC.H, LD,
+                   aquisition_time, sketch_snn_res.0.3, sketch_snn_res.0.5,
+                   sketch_snn_res.1, sketch_snn_res.2, seurat_clusters, 
+                   pred_snn_res.1, cluster_anno, sub.cluster, pred_sgl_snn_res.0.5,
+                   celltype, leverage.score, pred_snn_res.0.5)) %>% 
+  rename(prelim_type = doublet_type) 
+
+
+dbts_final <- dbts_obj_clean@meta.data %>%
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, FSC.A...FSC.H, LD,
+                   aquisition_time, cluster_anno, pred_sgl_snn_res.0.5, celltype, 
+                   pred_snn_res.0.5, sketch_snn_res.0.5, sketch_snn_res.1, leverage.score,
+                   sketch_snn_res.2, sketch_snn_res.3, seurat_clusters, sub.cluster)) %>% 
+  rename(cluster = pred_snn_res.1)
+
+# make sure all values except clustering, doublet type and umap_1/2 are the same 
+identical(dbts_export[rownames(dbts_final),c(1:54)], dbts_final[,c(1:53,55)]) # yes 
+
+# join
+interacting_landscape <- left_join(dbts_export, dbts_final)
+
+# export 
+write_csv(interacting_landscape, file = paste0(data.dir, Sys.Date(), "_in_vivo_lcmv_benchmarking_interacting_landscape.csv"), col_names = T, quote = "all")
+```
+
