@@ -24,7 +24,7 @@ library(writexl)
 
 set.seed(127)
 
-## functions
+# functions
 fit_tree <- function(df, r, params, classes){
   ## select parameters
   df <- df %>% filter(status_fine %in% classes, element_name == r)
@@ -49,28 +49,46 @@ fit_tree <- function(df, r, params, classes){
   return(list(model = model, index = idx, df = df))
 }
 
-## data 
-merged_small <- fread("./interactomics_framework/merged_small.csv")
+# data 
+data <- fread("./interactomics_framework/data/classified_data_CSposCSneg.csv")
 
-# use events classified as singlets or non-coincident multiplets 
-merged_small <- dplyr::filter(merged_small,status_fine!="conincident" & status_fine!="low_quality")
+# formatting 
+data <- data %>% rename(T_APCs = APC_T)
+colnames(data) <- colnames(data) %>%
+  str_replace_all("-", "_") %>%
+  str_replace_all("\\s\\(", "_") %>%
+  str_replace_all("\\)", "") %>%
+  str_replace_all("\\s", "_")
+
+# use CytoStim+ events classified as singlets or non-coincident multiplets 
+data <- data %>% 
+  dplyr::filter(!str_detect(element_name, "ctrl")) %>% 
+  dplyr::filter(status_fine!="conincident" & status_fine!="low_quality") %>% 
+  dplyr::select(c(FSC_ratio, FSC_A, FSC_H, FSC_W, SSC_A, SSC_H, SSC_W, 
+                  Eccentricity_FSC, Eccentricity_SSC, Comp_FITC_A, 
+                  Comp_APC_A, Comp_BV605_A, Comp_PE_Cy7_A, Comp_BV421_A, 
+                  LightLoss_Blue_A, Size_FSC, Size_SSC, status_broad,  
+                  status_fine, element_name, imageid, uniq_id))
+
 phases_fine <- c("singlet","doublet","triplet","low_quality","quadruplet_more","coincident")
 phases_broad <- c("singlet"   , "multiplet",  "undefined",  "coincident")
-merged_small <- merged_small %>%
+
+data <- data %>%
   mutate_at(vars(1:17), as.numeric) %>% as.data.frame()
 
-## models 
+# FEATURE IMPORTANCE MODEL -----------------------------------------------------
+# models 
 models <- list(
-  rep1 = list(r = 'Cytostim_1.fcs_6910', subset = colnames(merged_small)[-(18:22)], classes = phases_fine),
-  rep2 = list(r = 'Cytostim_5.fcs_16768', subset = colnames(merged_small)[-(18:22)], classes = phases_fine),
-  rep3 = list(r = 'Cytostim_2.fcs_34414', subset = colnames(merged_small)[-(18:22)], classes = phases_fine),
-  rep4 = list(r = 'Cytostim_3.fcs_46733', subset = colnames(merged_small)[-(18:22)], classes = phases_fine)) %>% 
-  map(~ {
-    fit_tree(merged_small, .x$r, .x$subset, .x$classes) 
+  rep1 = list(r = 'Cytostim_1.fcs_6910', subset = colnames(data)[-(18:22)], classes = phases_fine),
+  rep2 = list(r = 'Cytostim_5.fcs_16768', subset = colnames(data)[-(18:22)], classes = phases_fine),
+  rep3 = list(r = 'Cytostim_2.fcs_34414', subset = colnames(data)[-(18:22)], classes = phases_fine),
+  rep4 = list(r = 'Cytostim_3.fcs_46733', subset = colnames(data)[-(18:22)], classes = phases_fine)) %>% 
+  purrr::map(~ {
+    fit_tree(data, .x$r, .x$subset, .x$classes) 
   })
 
 ## parameter subset
-feature_imp <- models %>% map_df(~ {
+feature_imp <- models %>% purrr::map_df(~ {
   varImp(.x$model)$importance %>%
     as_tibble(rownames = 'feature') %>% 
     arrange(desc(Overall)) %>% 
@@ -96,6 +114,6 @@ p <- ggstripchart(feature_imp %>% mutate(feature = factor(feature, levels = leve
 print(p)
 
 # export source data 
-write_xlsx(p$data, path = "/fast/AG_Haas/Viktoria/NatMethods_revision/feature_importance_analysis/Figure1B_sourcedata.xlsx", col_names = T, format_headers = T)
+write_xlsx(p$data, path = "./interactomics_framework/data/Figure1B_sourcedata.xlsx", col_names = T, format_headers = T)
 
 
