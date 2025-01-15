@@ -1368,11 +1368,13 @@ print(ggplot(all_f1_scores %>% mutate(features = factor(features, levels = level
       )
 dev.off()
 
-######################
-##                  ##
-##  ADJ RAND INDEX  ##
-##                  ##
-######################
+########################
+##                    ##
+##   ADJ RAND INDEX   ##
+##                    ##
+##   Lea Jopp-Saile   ##
+##                    ##
+########################
 
 # repeat adjusted rand index, but on consensus clustering solutions
 image <- clust %>% dplyr::select(all_of(features), status_fine, status_broad, element_name, uniq_id, UMAP_X, UMAP_Y)
