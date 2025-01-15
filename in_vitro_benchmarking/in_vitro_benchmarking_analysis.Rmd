@@ -758,7 +758,7 @@ write_csv(overall_landscape, file = paste0(data.dir, Sys.Date(), "_in_vitro_benc
 # interacting landscape --------------------------------------------------------
 dbts_export <- dbts_obj@meta.data %>% 
   # keep homogenic clusters, remove low-quality 
-  dplyr::filter(!celltype == "remove") %>% 
+  dplyr::filter(!doublet_type == "remove") %>% 
   # drop unnecessary columns
   dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, aquisition_time,
                    FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1, FACS_snn_res.2,
