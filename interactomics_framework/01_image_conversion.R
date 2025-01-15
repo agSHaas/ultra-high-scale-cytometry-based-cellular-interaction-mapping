@@ -25,7 +25,7 @@ for (d in c(data.dir)) {
   ifelse(!dir.exists(d), dir.create(d), FALSE)
 }
 
-wsfile <- list.files(dir, pattern="CS_all_range.wsp",full=TRUE)
+wsfile <- list.files(data.dir, pattern="CS_all_range.wsp",full=TRUE)
 ws <- open_flowjo_xml(wsfile,sample_names_from="sampleNode")
 
 # extract gatingset from group called "samples"
@@ -147,8 +147,7 @@ purrr::map2(fiji_table_list, file_names, ~ save_tibble_as_csv(.x, .y))
 
 # CS1_ctrl: 27788 images, CS2_ctrl: 20267 images, CS3_ctrl: 27727 images, CS4_ctrl: 28148 images 
 
-# Viktoria: changed code to include CytoStim negative samples as controls 
-#############create final dataframes, on which interactive analysis and cell clustering can be run on
+# create final dataframes, on which interactive analysis and cell clustering can be run on
 jpg_cs1 <- "./interactomics_framework/20230616_1506_Cytostim_1/images-processed/"
 jpg_cs2 <- "./interactomics_framework/20230616_1508_Cytostim_2/images-processed/"
 jpg_cs3 <- "./interactomics_framework/20230616_1511_Cytostim_3/images-processed/"
@@ -179,14 +178,12 @@ jpg_names_list <- purrr::map(files_list, ~ .x %>% as.tibble() %>%
 complete_gated_list_4 <- purrr::map2(complete_gated_list_3, jpg_names_list, ~ left_join(.x, .y, by = "imageid"))
 
 
-####keep only cells that have an image
-library(purrr)
+# keep only CD45+ cells that have an image
 images_CS_cd45 <- map(complete_gated_list_4,~.x %>% dplyr::filter(`CD45+`=="TRUE"))
-
 paths_id_only <- purrr::map(images_CS_cd45, ~.x %>% dplyr::mutate(path_jpg = gsub("\\.\\.", "", path_jpg)))
+
 # Create a list of dataframes by mapping over jpg_vector and paths_id_only1
-# base_path <- "/Volumes/Domi_2/20230616_Exp1"
-base_path <- "/Users/nflore/Documents/S8_cytostim"
+base_path <- dir
 
 jpg_cs1 <- file.path(base_path, "20230616_1506_Cytostim_1")
 jpg_cs2 <- file.path(base_path, "20230616_1508_Cytostim_2")
@@ -198,14 +195,12 @@ jpg_ctrl2 <- file.path(base_path, "20230616_1454_Cytostim_ctrl_2")
 jpg_ctrl3 <- file.path(base_path, "20230616_1457_Cytostim_ctrl_3")
 jpg_ctrl4 <- file.path(base_path, "20230616_1502_Cytostim_ctrl_4")
 
-
-
 jpg_vector <- c(jpg_cs1, jpg_cs2, jpg_cs3, jpg_cs4, jpg_cs5, jpg_ctrl1, jpg_ctrl2, jpg_ctrl3, jpg_ctrl4)
 
 modified_paths_list <- map2(jpg_vector, paths_id_only, ~mutate(.y, extended_paths = paste0(.x, path_jpg)))
 names(modified_paths_list) <-  names(complete_gated_list_3)
 
-####add FSC_ratio
+# add FSC_ratio
 modified_paths_list <- purrr::map(modified_paths_list, ~.x %>% dplyr::mutate(FSC_ratio=`FSC-A`/`FSC-H`))
 
 # add thresholds for the FSC ratio, FSC-W and FSC-A ----
@@ -224,17 +219,7 @@ names(thresholds_fscratio) <- names(modified_paths_list)
 names(thresholds_fscwidth) <- names(modified_paths_list)
 names(thresholds_fscarea) <- names(modified_paths_list)
 
-# FSC ratio plots for QC 
-pdf(paste0("./interactomics_framework/FSCratio_histograms+OTSUthreshold.pdf"), onefile = T)
-for (i in names(modified_paths_list)){
-  cutoff <- calculateThreshold(hist(modified_paths_list[[i]]$FSC_ratio, breaks=500, plot = F))
-  hist(modified_paths_list[[i]]$FSC_ratio, breaks=500, main = i)
-  abline(v = cutoff, col = "red")
-}
-dev.off()
-
 # add columns telling whether a cell is above or below different OTSU derived thresholds
-
 # Function to add TRUE/FALSE columns based on the thresholds
 add_threshold_columns <- function(df, threshold_fscratio, threshold_fscwidth, threshold_fscarea) {
   df %>%
@@ -255,7 +240,7 @@ result_list <- pmap(
   add_threshold_columns
 )
 
-# remove 4th replicate, as quality of images is very low, remaining n = 4
+# remove 4th CytoStim+ replicate, as quality of images is very low
 result_list_final <- result_list[-4]
 
 # save 
