@@ -7,7 +7,7 @@ date: "2024-06-21"
 
 This is the analysis of the in vitro benchmarking experiments in Vonficht, Jopp-Saile, 
 Yousefian, Flore et al. Ultra-high scale cytometry-based cellular interaction mapping, 
-Nature Methods (2025). raw fcs files and pre-processed csv files can be found on Zenodo
+Nature Methods (2025). Raw fcs files and pre-processed csv files can be found on Zenodo
 at https://doi.org/10.5281/zenodo.10637096.
 
 date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
@@ -25,6 +25,7 @@ library(tidyr)
 library(rstatix)
 library(PICtR)
 library(writexl)
+library(readr)
 
 options(Seurat.object.assay.version = "v5")
 options(future.globals.maxSize = 2e9)
@@ -153,7 +154,7 @@ for (res in resolution) {
 }
 dev.off()
 
-# check clustering for each cluster at resolution 0.3 (rough anno)
+# check clustering for each cluster at resolution 0.3 (rough annotation)
 Idents(obj) <- "FACS_snn_res.0.3"
 pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_dimplot_highlighted_clusters_res0.3.pdf"), height = 7, width = 9, onefile = T)
 for (i in 1:length(unique(obj$FACS_snn_res.0.3))) {
@@ -326,7 +327,7 @@ DefaultAssay(dbts_obj) <- "dbts"
 # save obj
 saveRDS(dbts_obj, paste0(data.dir, "obj_doublets.rds"))
 
-# repeat seurat workflow
+# repeat Seurat workflow
 resolution <- c(0.3, 0.5, 1, 2)
 n_dims <- Features(dbts_obj) %>% length()
 dbts_obj <- dbts_obj %>%
@@ -389,7 +390,6 @@ dbts_obj <- FindSubCluster(dbts_obj, cluster = "19", graph.name = "dbts_snn", su
 pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_dimplot_subclustered_dbts.pdf"), height = 7, width = 9)
 DimPlot(dbts_obj, group.by = "sub.cluster.dbts", label = T)
 dev.off() 
-
 
 # subclustered RidgePlot 
 features <- Features(dbts_obj)
@@ -518,7 +518,7 @@ ggplot(dbts_obj@meta.data %>% dplyr::filter(!str_detect(sample, "cd45")) %>% dpl
   scale_color_manual(values = c("orangered3", "grey30"))
 dev.off()
 
-# anno 
+# annotation 
 pdf(paste0(plot.dir, "05_manuscript/", Sys.Date(), "_invitro_benchmark_doublets_umap.pdf"), height = 5, width = 6.5)
 dbts_obj_clean@meta.data %>% 
   ggplot(aes(umap_1, umap_2, color = doublet_type)) + 
@@ -529,7 +529,7 @@ dbts_obj_clean@meta.data %>%
   guides(colour = guide_legend(override.aes = list(size = 5)))
 dev.off()
 
-# feature plots CD45 label 1, label 2
+# feature plots CD45 label 1, label 2 interactions
 pdf(paste0(plot.dir, "05_manuscript/", Sys.Date(), "_invitro_benchmark_doublets_CD45features.pdf"), height = 7, width = 4.5)
 p1 <- FeaturePlot(dbts_obj_clean, features = c("CD45_1")) & scale_colour_gradientn(colours = pals::parula(1000)) 
 p2 <- FeaturePlot(dbts_obj_clean, features = c("CD45_2")) & scale_colour_gradientn(colours = pals::parula(1000)) 
@@ -712,7 +712,7 @@ t <- ggbarplot(time %>% dplyr::filter(doublet_type == "B*T"),
   scale_fill_manual(values = c("salmon", "#CC3C27", "lightsalmon1", "#E7872B"))
 
 
-# conc 
+# concentration 
 conc %>% dplyr::filter(doublet_type == "B*T") %>% 
   group_by(condition, combined) %>% 
   rstatix::shapiro_test(freq) # sample size not big enough (<3)
@@ -721,7 +721,7 @@ c <- ggbarplot(conc %>% dplyr::filter(doublet_type == "B*T"),
                x = "condition", y = "freq", fill = "combined", position = position_dodge(0.9), add = c("mean_sd", "point"), width = 0.8) + 
   scale_fill_manual(values = c("salmon", "#CC3C27", "lightsalmon1", "#E7872B"))
 
-# fix 
+# fixation 
 fix %>% dplyr::filter(doublet_type == "B*T") %>% 
   group_by(condition, combined) %>% 
   rstatix::shapiro_test(freq) # sample size not big enough (<3)
@@ -739,5 +739,52 @@ dev.off()
 write_xlsx(t$data, paste0(plot.dir, "05_manuscript/source_data/", "Supplementary_Figure_1G_time_source_data.xlsx"))
 write_xlsx(c$data, paste0(plot.dir, "05_manuscript/source_data/", "Supplementary_Figure_1G_conc_source_data.xlsx"))
 write_xlsx(f$data, paste0(plot.dir, "05_manuscript/source_data/", "Supplementary_Figure_1G_fix_source_data.xlsx"))
+```
+
+
+# export final datasets 
+```{r}
+# overall landscape ------------------------------------------------------------
+overall_landscape <- obj_clean@meta.data %>% 
+  # remove unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, aquisition_time, 
+                  FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1, 
+                  FACS_snn_res.2, FACS_snn_res.3, seurat_clusters)) %>% 
+  rename(cluster = sub.cluster)
+
+# export 
+write_csv(overall_landscape, file = paste0(data.dir, Sys.Date(), "_in_vitro_benchmarking_overall_landscape.csv"), col_names = T, quote = "all")
+
+# interacting landscape --------------------------------------------------------
+dbts_export <- dbts_obj@meta.data %>% 
+  # keep homogenic clusters, remove low-quality 
+  dplyr::filter(!celltype == "remove") %>% 
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, aquisition_time,
+                   FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1, FACS_snn_res.2,
+                   FACS_snn_res.3, seurat_clusters, sub.cluster, cluster_anno, 
+                   celltype, nCount_dbts, nFeature_dbts, dbts_snn_res.0.3,
+                   dbts_snn_res.0.5, dbts_snn_res.1, dbts_snn_res.2, double_pos, 
+                   sub.cluster.dbts, umap_1, umap_2)) %>% 
+  rename(prelim_type = doublet_type) 
+
+
+dbts_final <- dbts_obj_clean@meta.data %>%
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, aquisition_time,
+                   FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1, FACS_snn_res.2,
+                   FACS_snn_res.3, seurat_clusters, sub.cluster,  cluster_anno, 
+                   celltype, nCount_dbts, nFeature_dbts, dbts_snn_res.0.3, 
+                   dbts_snn_res.0.5, dbts_snn_res.1, dbts_snn_res.2)) %>% 
+  rename(cluster = sub.cluster.dbts)
+
+# make sure all values except clustering, doublet type and umap_1/2 are the same 
+identical(dbts_export[rownames(dbts_final),c(1:33)], dbts_final[,c(1:33)]) # yes 
+
+# join 
+interacting_landscape <- left_join(dbts_export, dbts_final)
+
+# export 
+write_csv(interacting_landscape, file = paste0(data.dir, Sys.Date(), "_in_vitro_benchmarking_interacting_landscape.csv"), col_names = T, quote = "all")
 ```
 
