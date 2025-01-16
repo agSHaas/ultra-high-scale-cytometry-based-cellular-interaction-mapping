@@ -90,7 +90,7 @@ complete_gated_list <- purrr::map2(cytoframe_list, gating_indices, ~ left_join(.
 names(complete_gated_list) <-sampleNames(gs)
 
 # we then need to create tables that can be used as insert for the ICS imageJ plugin to convert .tiff files to .jpg files
-# set paths to the image folders containg .tiff raw images
+# set paths to the image folders containing .tiff raw images (available upon request)
 tiffcs1 <- "./interactomics_framework/20230616_1506_Cytostim_1/images/" 
 tiffcs2 <- "./interactomics_framework/20230616_1508_Cytostim_2/images/" 
 tiffcs3 <- "./interactomics_framework/20230616_1511_Cytostim_3/images/" 
@@ -184,7 +184,7 @@ complete_gated_list_4 <- purrr::map2(complete_gated_list_3, jpg_names_list, ~ le
 images_CS_cd45 <- map(complete_gated_list_4,~.x %>% dplyr::filter(`CD45+`=="TRUE"))
 paths_id_only <- purrr::map(images_CS_cd45, ~.x %>% dplyr::mutate(path_jpg = gsub("\\.\\.", "", path_jpg)))
 
-# Create a list of dataframes by mapping over jpg_vector and paths_id_only1
+# Create a list of dataframes by mapping over jpg_vector and paths_id_only
 base_path <- dir
 
 jpg_cs1 <- file.path(base_path, "20230616_1506_Cytostim_1")

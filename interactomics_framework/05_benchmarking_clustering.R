@@ -11,6 +11,10 @@
 ##                                  ##      
 ######################################
 
+# this script benchmarks several clustering algorithms and feature spaces for 
+# clustering within the Interact-omics framework.. Manually classified images 
+# from image-enabled flow cytometry serve as ground-truth data. 
+
 # SETUP -------------------------------------------------------------------------
 # packages 
 library(PICtR)
@@ -57,7 +61,7 @@ set.seed(42)
 # functions
 triangle_thresholding <- function(hist) {
   # code ported from ImageJ's implementation of the triangle algorithm in java 
-  # initialise variables 
+  # initialize variables 
   min <- 0
   max <- 0 
   min2 <- 0
@@ -219,13 +223,12 @@ clust_bm <- data %>%
 clust_bm <- run.umap(clust_bm, use.cols = flow_param, umap.seed = 42) # umap with k = 15
 clust_bm <- as.data.table(clust_bm)
 
-# what is missclassified after otsu only? 
+# what is misclassified after otsu only?
 cols <- c("CD33pos" = "palegreen4", 
           "CD19pos" = "firebrick",
           "CD3pos" = "turquoise4",
           "other" = "navy")
 
-# get consensus cluster louvain anno from flow markers, plot split by ground truth and colored by gate
 pdf(paste0(plot.dir, Sys.Date(), "_missclassified_otsu_only_dotplot_gate.pdf"), width = 6.5, height = 4)
 p <- clust_bm %>% 
   dplyr::filter(status_broad == "singlet") %>% 
@@ -373,41 +376,7 @@ f1_scores <- f1_scores %>%
 saveRDS(clust_bm, paste0(data.dir, "clust_bm.rds"))
 saveRDS(f1_scores, paste0(data.dir, "f1_scores.rds"))
 
-ggbarplot(f1_scores, x = "method", y = "f1", fill = "i", add = "mean_sd", position = position_dodge(0.7)) + 
-  scale_y_continuous(breaks = c(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0), limits = c(0, 1.0))
 
-
-# stats 
-f1_scores %>% group_by(method) %>% shapiro_test(f1) # no normality to be assumed
-
-stats <- f1_scores %>% 
-  ungroup() %>%
-  pairwise_wilcox_test(f1 ~ method, ref.group = "louvain", p.adjust.method = "holm", paired = T) %>% 
-  add_y_position(step.increase = 0.8)
-
-ggplot(f1_scores %>% mutate(method = factor(method, levels = c("louvain", "leiden", "hdbscan", "FlowSOM_meta"))), 
-       aes(x = method, y = f1, fill = method)) + 
-  geom_boxplot() + 
-  geom_jitter(aes(color = i), alpha = 0.2) + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.75, 1.0)) + 
-  stat_pvalue_manual(stats, label = "p.adj") + 
-  scale_color_brewer(type = "qual", palette = "Set3") + 
-  scale_fill_brewer(type = "qual", palette = "Set2") + 
-  theme_classic() 
-  # stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
-  #              geom = "errorbar", color = "black", width = 0.3, size = 0.5)
-
-
-ggboxplot(f1_scores %>% mutate(method = str_extract(pred, "cluster_type_(.*)_[0-9]", group = 1)), 
-          x = "method", y = "f1", fill = "method") + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.75, 1.0)) + 
-  stat_pvalue_manual(stats, label = "p.adj")
-
-ggbarplot(f1_scores, x = "i", y = "f1", fill = "method", add = "mean_sd", position = position_dodge(0.7)) + 
-  scale_y_continuous(breaks = c(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0), limits = c(0, 1.0))
-
-
-  
 ##################################
 ##                              ##
 ##  add additional clustering   ## 
@@ -469,18 +438,8 @@ dev.off()
 saveRDS(clust_bm, paste0(data.dir, "clust_bm_incl_phenograph.rds"))
 saveRDS(f1_scores, paste0(data.dir, "f1_scores_incl_phenograph.rds"))
 
-# plot comparison
-ggplot(f1_scores %>% mutate(method = factor(method, levels = c("louvain", "phenograph_louvain", "leiden", "phenograph_leiden", "hdbscan", "FlowSOM_meta"))), 
-       aes(x = method, y = f1, fill = method)) + 
-  geom_boxplot() + 
-  geom_jitter(aes(color = i), alpha = 0.2) + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.75, 1.0)) + 
-  # stat_pvalue_manual(stats, label = "p.adj") + 
-  scale_color_brewer(type = "qual", palette = "Set3") + 
-  scale_fill_brewer(type = "qual", palette = "Set2") + 
-  theme_classic() 
   
-
+# immunoclust, flowMeans, rclusterpp
 pdf(paste0(res.dir, Sys.Date(), "_benchmarking_clustering_ratio_cluster_plots_immunoclust_flowMeans_rclusterpp.pdf"), height = 6, width = 10, onefile = T)
 for (i in 1:100) {
   message(paste0("iteration: ", i))
@@ -488,7 +447,7 @@ for (i in 1:100) {
   # save random seed
   seed <- sample(1:1000000, size = 1)
 
-  # immunoClust, estimated runtime = 10h 
+  # immunoClust, estimated run time = 10h 
   set.seed(seed)
   immunoclust <- immunoClust::cell.MajorIterationLoop(clust_bm, parameters = flow_param,
                                                       I.buildup=6, I.final=4,
@@ -512,7 +471,7 @@ for (i in 1:100) {
   set.seed(seed)
   rclusterpp_res <- Rclusterpp.hclust(clust_bm %>% dplyr::select(all_of(flow_param)), method = "ward", distance = "euclidean")
   
-  # cut tree at k = 20 (overclustering) and extract labels 
+  # cut tree at k = 20 (over-clustering) and extract labels 
   clust_bm[[paste0("rclusterpp_", seed)]] <- factor(cutree(rclusterpp_res, k = 20))
   
   # F1 scores ----
@@ -561,16 +520,6 @@ dev.off()
 saveRDS(clust_bm, paste0(data.dir, "clustering_benchmark_incl_all_algorithms.rds"))
 saveRDS(f1_scores, paste0(data.dir, "f1_scores_incl_all_algorithms.rds"))
 
-# plot comparison
-ggplot(f1_scores %>% mutate(method = factor(method, levels = c("louvain", "phenograph_louvain", "leiden", "phenograph_leiden", "hdbscan", "FlowSOM_meta", "flowMeans", "rclusterpp", "immunoclust"))), 
-       aes(x = method, y = f1, fill = method)) + 
-  geom_boxplot() + 
-  geom_jitter(aes(color = i), alpha = 0.2) + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.75, 1.0)) + 
-  # stat_pvalue_manual(stats, label = "p.adj") + 
-  scale_color_brewer(type = "qual", palette = "Set3") + 
-  scale_fill_brewer(type = "qual", palette = "Set2") + 
-  theme_classic() 
 
 # plots -----
 levels <- c("louvain", "phenograph_louvain", "leiden", "phenograph_leiden", "hdbscan", "FlowSOM_meta", "flowMeans", "rclusterpp", "immunoclust") 
@@ -629,6 +578,7 @@ clust <- as.data.table(clust)
 f1_scores_import <- data.frame() # empty results df for f1 scores
 list <- list() # empty list for consensus classification 
 
+# 100 iterations
 pdf(paste0(res.dir, Sys.Date(), "_benchmarking_clustering_ratio_cluster_plots_important_features.pdf"), height = 6, width = 10, onefile = T)
 for (i in 1:100) {
   message(paste0("iteration: ", i))
@@ -688,15 +638,6 @@ f1_scores_import <- f1_scores_import %>%
 
 # save
 saveRDS(f1_scores_import, paste0(data.dir, "f1_scores_import.rds"))
-
-ggplot(f1_scores_import, aes(x = features, y = f1, fill = i)) + 
-  geom_boxplot() + 
-  geom_jitter(aes(color = i), alpha = 0.2) + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.75, 1.0)) + 
-  # stat_pvalue_manual(stats, label = "p.adj") + 
-  scale_color_brewer(type = "qual", palette = "Set3") + 
-  scale_fill_brewer(type = "qual", palette = "Set2") + 
-  theme_classic() 
 
 
 # consensus clustering solution
@@ -778,7 +719,6 @@ print(ggplot(clust, aes(x = UMAP_X, y = -UMAP_Y, color = otsu)) +
         guides(colour = guide_legend(override.aes = list(size = 5))))
 dev.off()
 
-
 # plot barplot with ground truth anno 
 bar <- clust %>% 
   mutate(status_fine = factor(status_fine, levels = c("quadruplet_more", "triplet", "doublet", "singlet"))) %>%
@@ -838,6 +778,7 @@ clust_markers <- as.data.table(clust_markers)
 f1_scores_markers <- data.frame() # empty results df for f1 scores
 list_markers <- list() # empty list for consensus classification 
 
+# 100 iterations
 pdf(paste0(res.dir, Sys.Date(), "_benchmarking_clustering_ratio_cluster_plots_markers_only.pdf"), height = 6, width = 10, onefile = T)
 for (i in 1:100) {
   message(paste0("iteration: ", i))
@@ -897,16 +838,6 @@ f1_scores_markers <- f1_scores_markers %>%
 
 saveRDS(f1_scores_markers, paste0(data.dir, "f1_scores_markers.rds"))
 
-ggplot(f1_scores_markers, aes(x = features, y = f1, fill = i)) + 
-  geom_boxplot() + 
-  geom_jitter(aes(color = i), alpha = 0.2) + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.75, 1.0)) + 
-  # stat_pvalue_manual(stats, label = "p.adj") + 
-  scale_color_brewer(type = "qual", palette = "Set3") + 
-  scale_fill_brewer(type = "qual", palette = "Set2") + 
-  theme_classic() 
-
-
 # consensus clustering solution
 partition_list_markers <- cl_ensemble(list = lapply(list_markers, as.cl_hard_partition))
 set.seed(42)
@@ -960,7 +891,7 @@ ggplot(clust_markers, aes(x = UMAP_X, y = UMAP_Y, color = sub.cluster)) + geom_p
 # CD3-PE-Cy7
 # CD45-APC
 
-# anno (same as Domi)
+# annotation
 clust_markers <- clust_markers %>% 
   dplyr::mutate(celltype = case_when(
     sub.cluster %in% c("4", "5", "8", "10", "16", "17") ~ "T cells",
@@ -979,7 +910,7 @@ ggplot(clust_markers, aes(x = UMAP_X, y = -UMAP_Y, color = otsu)) + geom_point()
   scale_color_manual(values = c("#264896", "#D6D6D6"))
 
 # manuscript figures 
-# extended data fugure 1H 
+# extended data figure 1H 
 pdf(paste0(plot.dir, Sys.Date(), "_louvain_markers_anno.pdf"), width = 9, height = 8)
 print(ggplot(clust_markers, aes(x = UMAP_X, y = -UMAP_Y, color = celltype)) + 
         ggrastr::geom_point_rast(size = 3.5, color = "black", raster.dpi = 700) + 
@@ -1010,7 +941,7 @@ print(ggplot(clust_markers, aes(x = UMAP_X, y = -UMAP_Y, color = otsu)) +
         guides(colour = guide_legend(override.aes = list(size = 5))))
 dev.off()
 
-# plot barplot with ground truth anno 
+# plot bar plot with ground truth annotation 
 bar_markers <- clust_markers %>% 
   mutate(status_fine = factor(status_fine, levels = c("quadruplet_more", "triplet", "doublet", "singlet"))) %>%
   mutate(celltype = factor(celltype, levels = c("My*T*B", "My*T", "B*T", "CD33high Myeloid", "CD33low Myeloid", "T cells", "B cells", "other CD45+"))) %>%
@@ -1124,7 +1055,7 @@ for (i in 1:nrow(clust_bm)) {
 # CD3-PE-Cy7
 # CD45-APC
 
-# anno (same as Domi)
+# annotation
 clust_bm <- clust_bm %>% 
   dplyr::mutate(celltype = case_when(
     sub.cluster %in% c("9", "11", "14", "15") ~ "T cells",
@@ -1136,14 +1067,6 @@ clust_bm <- clust_bm %>%
     sub.cluster  == "12_1" ~ "My*T",
     sub.cluster  == "12_2" ~ "My*T*B",
     TRUE ~ "")) # Use an empty string as the default value
-
-ggplot(clust_bm, aes(x = UMAP_X, y = UMAP_Y, color = celltype)) + geom_point() + theme_classic() + 
-  scale_color_manual(values = cols)
-ggplot(clust_bm %>% mutate(status_fine = factor(status_fine, levels = c("quadruplet_more", "triplet", "doublet", "singlet"))), 
-       aes(x = UMAP_X, y = UMAP_Y, color = status_fine)) + geom_point() + theme_classic() + 
-  scale_color_manual(values = c("#4F80AF", "#A490BF", "#F2911A", "#D6D6D6"))
-ggplot(clust_bm, aes(x = UMAP_X, y = UMAP_Y, color = otsu)) + geom_point() + theme_classic() + 
-  scale_color_manual(values = c("#264896", "#D6D6D6"))
 
 # manuscript figures 
 # Figure 1F
@@ -1319,15 +1242,6 @@ all_f1_scores <- rbind(f1_scores_flow %>% dplyr::select(-method), f1_scores_mark
 saveRDS(all_f1_scores, paste0(data.dir, "all_f1_scores_clustering.rds"))
 
 # plot
-ggplot(all_f1_scores, aes(x = features, y = f1)) + 
-  geom_boxplot(aes(fill = features)) + 
-  geom_jitter(aes(color = i), alpha = 0.2) + 
-  scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.70, NA)) + 
-  scale_fill_manual(values = cols) + 
-  scale_color_manual(values = cols) + 
-  theme_classic() # + 
-  # stat_summary(fun = mean, fun.max = mean, fun.min = mean, width = 0.5, geom = "errorbar")
-
 cols <- c("otsu" = "#768EC3", 
           "markers" = "#768EC3", 
           "flow+scatter+ratio" = "#768EC3", 
@@ -1347,12 +1261,12 @@ p <- ggbarplot(all_f1_scores %>% mutate(features = factor(features, levels = lev
   theme(axis.text.x = element_text(angle = 65, hjust = 1)) + 
   stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
                geom = "errorbar", color = "black", width = 0.5, size = 0.5) + 
-  # stat_pvalue_manual(stats, label = "p.adj", hide.ns = T) + 
   geom_jitter(aes(fill = i), width = 0.2, height = 0, size = 1, shape = 21,  color = "black") + 
   scale_fill_manual(values = cols)
 print(p)
 dev.off()
 
+# export source data
 write_xlsx(p$data, paste0(plot.dir, "Figure1E_sourcedata.xlsx"))
 
 pdf(paste0(plot.dir, Sys.Date(), "_clustering_methods_benchmark_boxplots.pdf"), height = 4.5, width = 6)
@@ -1360,11 +1274,9 @@ print(ggplot(all_f1_scores %>% mutate(features = factor(features, levels = level
         geom_boxplot(aes(fill = features)) + 
         geom_jitter(aes(color = i), alpha = 0.2) + 
         scale_y_continuous(breaks = c(0.8, 0.9, 1.0), limits = c(0.70, NA)) + 
-        # stat_pvalue_manual(stats, label = "p.adj") + 
         scale_fill_manual(values = cols) + 
         scale_color_manual(values = cols) + 
-        theme_classic() # + 
-      # stat_summary(fun = mean, fun.max = mean, fun.min = mean, width = 0.5, geom = "errorbar")
+        theme_classic()
       )
 dev.off()
 
@@ -1441,6 +1353,7 @@ rand_df <- data.frame(x = seq(0,2, by = 0.1), y = rand_index)
 
 saveRDS(rand_df, paste0(data.dir, "rand_df.rds"))
 
+# plot
 pdf(paste0(plot.dir, Sys.Date(), "_adjusted_rand_index_consensus.pdf"), height = 4.3, width = 5)
 p <- ggplot(rand_df, aes(x,y)) + 
   geom_line(aes(colour = "adjusted_rand_index"), size = 2) +

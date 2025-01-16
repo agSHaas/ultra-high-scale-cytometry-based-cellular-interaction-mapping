@@ -5,12 +5,20 @@
 ##                                  ##
 ##  GROUNDTRUTH DATA: CYTOSTIM+     ##
 ##        S8 IMAGING DATA           ##
-##               HD                 ##
+##          HEIDELBERG              ##
 ##                                  ##
 ##                                  ##
-##        Viktoria, 2024            ##
+##     Viktoria Flore, 2024         ##
 ##                                  ##      
 ######################################
+
+
+# this script benchmarks the classification of singlets and multiplets in flow
+# cytometry data, using manually classified image-enabled flow cytometry data as 
+# ground-truth. Evaluated methods include Otsu thresholding, the triangle
+# algorithm, kmeans clustering, a GMM model, and methods from image thresholding 
+# such as Huang, Intermodes, IsoData, Li, Mean, RenyiEntropy, and Shanbhag.  
+
 
 # SETUP -------------------------------------------------------------------------
 # packages 
@@ -53,7 +61,7 @@ set.seed(42)
 # functions
 triangle_thresholding <- function(hist) {
   # code ported from ImageJ's implementation of the triangle algorithm in java 
-  # initialise variables 
+  # initialize variables 
   min <- 0
   max <- 0 
   min2 <- 0
@@ -99,7 +107,6 @@ triangle_thresholding <- function(hist) {
       dmax <- counts[i]
     }
   }
-  
   
   # two possible thresholds for the two sides of the histogram - find the side
   # where the distance of the peak to the minumun is furthest 
@@ -194,7 +201,7 @@ colnames(all) <- colnames(all) %>%
   str_replace_all("\\s", "_")
 
 # remove undefined and coincident events from the start 
-# subset on CS+ cause that's what's done in Figure 1
+# subset on CS+ to focus on interactions
 data <- all %>% 
   dplyr::filter(status_broad %in% c("singlet", "multiplet")) %>% 
   dplyr::filter(!str_detect(element_name, "ctrl"))
@@ -246,7 +253,7 @@ data <- data %>% mutate(km_clust_ratio = if_else(km_clust_ratio == 1, "singlet",
 
 # plot
 ggplot(data, aes(x = FSC_ratio, fill = km_clust_ratio)) + geom_histogram(bins = 1000)
-ggplot(data, aes(x = FSC_ratio, fill = km_clust_ratio)) + geom_histogram(bins = 1000) + geom_vline(xintercept = otsu_threshold) # almost corresponds to otsu threshold 
+ggplot(data, aes(x = FSC_ratio, fill = km_clust_ratio)) + geom_histogram(bins = 1000) + geom_vline(xintercept = otsu_threshold)
 
 # confusion matrix + heatmap 
 km_ratio_res <- data %>% 
