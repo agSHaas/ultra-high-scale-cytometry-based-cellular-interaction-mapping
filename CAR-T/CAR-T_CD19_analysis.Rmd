@@ -67,7 +67,8 @@ list <- lapply(files, function(csv) {
     mutate(time = if_else(str_detect(sample, "A11|A12|B11|B12|C11|C12|D11|D12"), true = 0.5, false = time)) %>%
     mutate(time = if_else(str_detect(sample, "A8|A9|B8|B9|C8|C9|D8|D9"), true = 1, false = time)) %>%
     mutate(time = if_else(str_detect(sample, "A5|A6|B5|B6|C5|C6|D5|D6"), true = 2, false = time)) %>%
-    mutate(time = if_else(str_detect(sample, "A2|A3|B2|B3|C2|C3|D2|D3"), true = 3, false = time))
+    mutate(time = if_else(str_detect(sample, "A2|A3|B2|B3|C2|C3|D2|D3"), true = 3, false = time)) %>% 
+    mutate(condition = if_else(str_detect(sample, "Bcells"), true = "control", false = "CAR"))
   return(tab)
 })
 
