@@ -90,7 +90,7 @@ data <- data %>%
                                group == "B+D" ~ "control+control"))
 
 # remove samples that included mouse A4. No CD90.1 cells present although they 
-# should have been transferred inthis group (and are visible for A1-A3)
+# should have been transferred in this group (and are visible for A1-A3)
 # maybe experimental error?   
 data <- data %>% 
   dplyr::filter(!sample %in% c("export_v2_A4 4_Cells_live.csv", "export_v2_C4 12_Cells_live.csv", "export_v2_C8 16_Cells_live.csv")) 

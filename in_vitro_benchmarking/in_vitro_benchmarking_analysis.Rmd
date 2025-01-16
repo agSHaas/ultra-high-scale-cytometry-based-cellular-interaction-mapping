@@ -494,11 +494,6 @@ colors_dbts <- c("B*T" = "seagreen4",
                  "CD4*CD8" = "coral2",
                  "DC*My" = "firebrick")  
 
-DimPlot(dbts_obj_clean, group.by = "doublet_type", cols = colors_dbts, label = T)
-
-DimPlot(dbts_obj_clean, group.by = "doublet_type", split.by = "cytostim", cols = colors_dbts, label = T)
-DimPlot(dbts_obj_clean, group.by = "doublet_type", split.by = "double_pos", cols = colors_dbts, label = T)
-
 dbts_obj_clean$umap_1 <- dbts_obj_clean@reductions$dbtsuamp@cell.embeddings[,1]
 dbts_obj_clean$umap_2 <- dbts_obj_clean@reductions$dbtsuamp@cell.embeddings[,2]
 

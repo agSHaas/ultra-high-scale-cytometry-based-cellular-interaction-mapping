@@ -1007,7 +1007,7 @@ ctrl <- quant %>%
 quant <- quant %>%
   left_join(ctrl, by = "gate") %>%
   mutate(log2FC = log2(freq / ctrl_mean), 
-         FC = freq / ctrl_mean) # continue with FC cause log2FC leads to NA 
+         FC = freq / ctrl_mean) # continue with FC
 
 # stats 
 quant %>% group_by(gate, condition) %>% rstatix::shapiro_test(FC) # normality cannot be assumed
