@@ -14,6 +14,8 @@ library(PICtR)
 # adapted from Schraivogel et al. (2022) 10.1126/science.abj3013, see also
 # https://github.com/benediktrauscher/ICS/blob/master/vignettes/flow_data_processing.Rmd
 
+# raw tiff files that were processed with the Fiji plugin are available upon request.
+
 # Authors: Dominik Vonficht, Viktoria Flore, adapted from Daniel Schraivogel
 
 # EXTRACT DATA -----------------------------------------------------------------
