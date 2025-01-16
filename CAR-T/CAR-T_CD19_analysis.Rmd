@@ -226,7 +226,7 @@ CD19@meta.data %>%
   dplyr::filter(!is.na(seurat_clusters), sub.cluster %in% dbts) %>%
   group_by(sub.cluster, group) %>% 
   count() %>% 
-  mutate(of_total = n / 100000) # sketched space enriched for doublets 
+  mutate(of_total = n / 100000) 
 
 CD19@meta.data %>% 
   dplyr::filter(pred_snn_res.0.3 %in% dbts) %>% 
@@ -237,12 +237,12 @@ CD19@meta.data %>%
 # QC plots ----
 # per condition
 pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_CARvsControl.pdf"), height = 7, width = 9, onefile = T)
-DimPlot(CD19, group.by = "condition") # small batch effect in cluster 14, but negliable  
+DimPlot(CD19, group.by = "condition")  
 dev.off()
 
 # by time
 pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_time_.pdf"), height = 7, width = 9, onefile = T)
-DimPlot(CD19, group.by = "time") # only the shift as seen for case vs control 
+DimPlot(CD19, group.by = "time")
 dev.off()
 
 # check area/height ratio distribution and cutoff
@@ -388,6 +388,12 @@ print(DimPlot(CD19_clean, reduction = 'umap', group.by = res, label = T) +
 }
 dev.off()
 
+##########################
+##        choose        ##
+##  sketch_snn_res.0.5  ## 
+##                      ##
+##########################
+
 # check clustering 
 Idents(CD19_clean) <- "sketch_snn_res.0.5"
 pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_highlighted_clusters_res.0.5_clean.pdf"), height = 7, width = 9, onefile = T)
@@ -395,12 +401,6 @@ for (i in 0:24) {
   print(DimPlot(CD19_clean, cells.highlight = WhichCells(CD19_clean, idents = as.character(i))))
 }
 dev.off()
-
-##########################
-##        choose        ##
-##  sketch_snn_res.0.5  ## 
-##                      ##
-##########################
 
 # # subcluster cluster 8, 23
 Idents(CD19_clean) <- 'sketch_snn_res.0.5'
@@ -433,7 +433,7 @@ p1 <- CD19_clean@meta.data %>%  group_by(pred_snn_res.0.5, ratio_anno) %>% count
     ggtitle("Cluster Analysis") +
     theme_minimal()
 
-# # select doublet clusters
+# select doublet clusters
 CD19_clean <- select_dbt(CD19_clean, clusters = 'pred_snn_res.0.5', selected_clusters = "doublet_clusters", quantile = 0.8)
 CD19_clean <- select_dbt(CD19_clean, clusters = 'pred_snn_res.0.5', selected_clusters = "doublet_clusters", quantile = 0.85) 
 
@@ -927,7 +927,6 @@ CD19_clean@meta.data %>%
         guides(colour = guide_legend(override.aes = list(size=5)))
 dev.off()
 
-
 # supplement figure features
 Feature_Plot <- FeaturePlot(CD19_clean, features=colnames(CD19_clean@meta.data)[c(4:6,9,11:37, 43)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 1.5)
 for(i in 1:length(Feature_Plot)) suppressMessages({
@@ -1065,7 +1064,7 @@ stat.test_CD4 <- fc_CD4 %>% dplyr::filter(condition == "CAR", time == 1) %>%
   add_significance() %>% 
   add_xy_position()
 
-# plot individual points instead of boxplots 
+# plot individual points
 p1 <- ggstripchart(fc_CD4 %>% dplyr::filter(condition == "CAR", time == 1), 
              x = "doublet_type", y = "eAB",  add = "mean_sd", 
              error.plot = "errorbar", fill = "doublet_type", 
@@ -1143,7 +1142,7 @@ stat.test_CD8 <- fc_CD8 %>% dplyr::filter(condition == "CAR", time == 1) %>%
   add_significance() %>% 
   add_xy_position()
 
-# plot individual points instead of boxplots 
+# plot individual points
 p2 <- ggstripchart(fc_CD8 %>% dplyr::filter(condition == "CAR", time == 1), 
              x = "doublet_type", y = "eAB",  add = "mean_sd", 
              error.plot = "errorbar", fill = "doublet_type", 

@@ -189,9 +189,6 @@ cutoff <- calculateThreshold(hist(ova@meta.data$ratio, breaks = 2000, plot = F))
 abline(v=cutoff) 
 dev.off() 
 
-# check FSC.H vs FSC.A in dotplot 
-ggplot(ova@meta.data, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point() 
-
 # plot some QC figures together
 cutoff <- calculateThreshold(hist(ova@meta.data$ratio, breaks = 2000, plot = F))
 p1 <- DimPlot(ova, group.by = "FACS_snn_res.0.5", label = T)
@@ -271,7 +268,7 @@ ova_clean@meta.data <- ova_clean@meta.data %>% dplyr::select(-c(FACS_snn_res.0.3
 ova_clean@misc <- list() 
 
 # repeat workflow 
-n_dims <- Features(ova_clean) %>% length() # 20 Features
+n_dims <- Features(ova_clean) %>% length()
 resolution <- c(0.3,0.5)
 ova_clean <- ova_clean %>% 
   FindVariableFeatures() %>% 
@@ -372,9 +369,6 @@ hist(ova_clean@meta.data$ratio, breaks = 2000)
 cutoff <- calculateThreshold(hist(ova_clean@meta.data$ratio, breaks = 2000, plot = F))
 abline(v=cutoff) 
 dev.off() 
-
-# check FSC.H vs FSC.A in dotplot 
-ggplot(ova_clean@meta.data, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point() 
 
 # plot some QC figures together
 cutoff <- calculateThreshold(hist(ova_clean@meta.data$ratio, breaks = 2000, plot = F))
@@ -739,7 +733,7 @@ colors <- c("DCs" = "#99708d",
 
 DimPlot(ova_clean, group.by = "celltype", label = T, cols = colors)
 
-# UMAP Domi style 
+# UMAP
 ova_clean$umap_1 <- ova_clean@reductions$umap@cell.embeddings[,1]
 ova_clean$umap_2 <- ova_clean@reductions$umap@cell.embeddings[,2]
 
