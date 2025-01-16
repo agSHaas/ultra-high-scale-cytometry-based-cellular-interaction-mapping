@@ -1,0 +1,1267 @@
+---
+title: "Analysis CD19 CAR-T Data"
+output: html_notebook
+author: "Viktoria Flore"
+date: "2024-01-15"
+---
+
+This is the analysis script for the CAR-T cell experiment in Vonficht, Jopp-Saile, 
+Yousefian, Flore et al. Ultra-high scale cytometry-based cellular interaction 
+mapping, Nature Methods (2025). Pre-processed csv files can be found on Zenodo
+at https://doi.org/10.5281/zenodo.10637096.
+
+# load packages and set paths 
+```{r results='hide', message=FALSE, warning=FALSE}
+library(Seurat)
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 2e9)
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(readr)
+library(BPCells)
+library(pals)
+library(tidyverse)
+library(dplyr)
+library(rstatix)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsci)
+library(ggrastr)
+library(khroma)
+library(pbapply)
+library(viridis)
+library(MASS)
+library(clustree)
+library(ggrepel)
+library(ggpointdensity)
+library(cytoMEM)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+library(writexl)
+library(PICtR) # version 0.1.0
+
+dir <- "./CAR-T/"
+data.dir <- "./CAR-T/data/"
+plot.dir <- "./CAR-T/plots/"
+input.dir <- "./CAR-T/csv_files/"
+
+# experiment 
+exp <- "CAR-T"
+```
+
+# load CAR-T data 
+```{r}
+files <- dir(paste0(input.dir), pattern="*.csv")
+
+# read channel values and save in list
+list <- lapply(files, function(csv) {
+  # read csv
+  tab <- read.table(paste0(input.dir, csv), header = T, sep = ",")
+  # extract meta data 
+  tab$sample <- csv
+  tab$group <- "CD19_CAR"
+  tab$time <- 0
+  tab <- tab %>% 
+    mutate(time = if_else(str_detect(sample, "A11|A12|B11|B12|C11|C12|D11|D12"), true = 0.5, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "A8|A9|B8|B9|C8|C9|D8|D9"), true = 1, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "A5|A6|B5|B6|C5|C6|D5|D6"), true = 2, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "A2|A3|B2|B3|C2|C3|D2|D3"), true = 3, false = time))
+  return(tab)
+})
+
+# combine into one dataframe
+data <- bind_rows(list)
+
+# format 
+data <- data %>% 
+  rename(NK1.1 = Nk11, AF = Comp.AF.A, acquisition_time = Time) %>% 
+  # remove A2 and A3 sample since the voltages for scatter channels were different during acquisition, remove E3, E4, F4 controls
+  dplyr::filter(!sample %in% c("export_comp_scale_QC_mouseCAR-T_Ruth_VF_A2_live.csv", 
+                               "export_comp_scale_QC_mouseCAR-T_Ruth_VF_A3_live.csv", 
+                               "export_comp_scale_QC_mouseCAR_T_Ruth_VF_E3_live.csv", 
+                               "export_comp_scale_QC_mouseCAR_T_Ruth_VF_E4_live.csv", 
+                               "export_comp_scale_QC_mouseCAR_T_Ruth_VF_F4_live.csv"))
+
+# sketching ----
+CD19 <- sketch_wrapper(channel=data[,c(1:6,8:34)],
+                     meta_data=data,
+                     assay="FACS",
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     n_sketch_cells=100000,
+                     n_dims,
+                     resolution=c(0.3,0.5,1,2),
+                     obj_name="obj_sketched_non_projected",
+                     group_by=NULL,
+                     verbose=TRUE,
+                     BPcell_dir=NULL,
+                     ratio=TRUE,
+                     working_dir=paste0(data.dir))
+```
+
+# select doublet clsuters and project cluster labels 
+```{r}
+# directories
+ifelse(!dir.exists(paste0(plot.dir, "02_qc/")), dir.create(paste0(plot.dir, "02_qc/")), FALSE)
+ifelse(!dir.exists(paste0(plot.dir, "01_doublets/")), dir.create(paste0(plot.dir, "01_doublets/")), FALSE)
+
+# sketched cells 
+sketched <- CD19@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# clustering resolutions
+resolution <- c("sketch_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+
+# clustree plot 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_clustree_all_events.pdf"), height = 7, width = 14)
+clustree(CD19 %>% subset(cells = rownames(sketched)), prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+# ratio cluster plots and preliminary selection of doublet clusters
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  CD19 <- select_dbt(CD19, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(CD19, clusters = res))
+}
+dev.off()
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clusters.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+print(DimPlot(CD19, reduction = 'umap', group.by = res, label = T) + 
+  labs(title = paste0(res)))
+}
+dev.off()
+
+# check clustering for each cluster
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_highlighted_clusters.pdf"), height = 7, width = 9, onefile = T)
+for (i in 0:22) {
+  print(DimPlot(CD19, cells.highlight = WhichCells(CD19, idents = as.character(i))))
+}
+dev.off()
+
+##########################
+##        choose        ##
+##  sketch_snn_res.0.3  ##
+##                      ##
+##########################
+
+# subcluster cluster 9 and 17 
+Idents(CD19) <- 'sketch_snn_res.0.3'
+CD19 <- FindSubCluster(CD19, cluster = "9", resolution = 0.1, graph.name = "sketch_snn", subcluster.name = "sub.cluster.9")
+Idents(CD19) <- "sub.cluster.9"
+CD19 <- FindSubCluster(CD19, cluster = "17", resolution = 0.1, graph.name = "sketch_snn", subcluster.name = "sub.cluster")
+
+# coerce subcluster names for project_data() to work 
+CD19@meta.data <- CD19@meta.data %>% 
+  mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", "."))
+
+# project chosen clustering to all cells
+CD19 <- project_data(obj = CD19,
+                     data_query = CD19, 
+                     ref_clusters = "sub.cluster", 
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_snn_res.0.3",
+                     chunk_size=1000000, 
+                     assay_ref = "sketch", 
+                     assay_query = "FACS")
+
+# select doublet clusters
+CD19 <- select_dbt(CD19, clusters = 'pred_snn_res.0.3', selected_clusters = "doublet_clusters", quantile = 0.8)
+CD19 <- select_dbt(CD19, clusters = 'pred_snn_res.0.3', selected_clusters = "doublet_clusters", quantile = 0.9) # pick 0.9 percentile 
+
+# ratio cluster plot for all projected cells 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events_projected.pdf"), height = 7, width = 14)
+print(ratio_cluster_plot(CD19, clusters = 'pred_snn_res.0.3')) # doublet clusters: 5, 9.1, 12
+dev.off()
+
+# add doublet cluster annotation to meta.data
+dbts <- CD19@misc$doublet_clusters_q0.9
+CD19@meta.data <- CD19@meta.data %>% 
+  mutate(cluster_anno_res.0.3 = if_else(condition = as.character(pred_snn_res.0.3) %in% dbts, 
+                                        true = "doublet_cluster", false = "singlet_cluster"))
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = CD19, file = paste0(data.dir, "obj_sketched_projected.rds"), destdir = paste0(data.dir, "/counts"))
+```
+
+# quality control
+```{r}
+# subset meta.data from sketched cells 
+sketched <- CD19@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# total number of events 
+total <- 853880
+
+# compare in sketched and complete data set:  
+# cells from each condition ----
+CD19@meta.data %>% 
+  group_by(condition) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+sketched %>% 
+  group_by(condition) %>% 
+  count() %>% 
+  mutate(of_total = n / 100000) # same proportions
+
+# cells from each time point ----
+CD19@meta.data %>% 
+  group_by(time) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+sketched %>% 
+  group_by(time) %>% 
+  count() %>% 
+  mutate(of_total = n / 100000) # similar 
+
+# doublet cluster sizes per group in sketched and projected ----
+CD19@meta.data %>% 
+  dplyr::filter(!is.na(seurat_clusters), sub.cluster %in% dbts) %>%
+  group_by(sub.cluster, group) %>% 
+  count() %>% 
+  mutate(of_total = n / 100000) # sketched space enriched for doublets 
+
+CD19@meta.data %>% 
+  dplyr::filter(pred_snn_res.0.3 %in% dbts) %>% 
+  group_by(pred_snn_res.0.3, group) %>% 
+  count() %>% 
+  mutate(of_total = n / total) 
+
+# QC plots ----
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_CARvsControl.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(CD19, group.by = "condition") # small batch effect in cluster 14, but negliable  
+dev.off()
+
+# by time
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_time_.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(CD19, group.by = "time") # only the shift as seen for case vs control 
+dev.off()
+
+# check area/height ratio distribution and cutoff
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_ratio_histogram.pdf"), height = 6, width = 8, onefile = T)
+hist(CD19@meta.data$ratio, breaks = 2000)
+cutoff <- calculateThreshold(hist(CD19@meta.data$ratio, breaks = 2000, plot = F))
+abline(v=cutoff) 
+dev.off()
+
+# plot some QC plots together as a summary
+cutoff <- calculateThreshold(hist(CD19@meta.data$ratio, breaks = 2000, plot = F))
+p1 <- DimPlot(CD19, group.by = "pred_snn_res.0.3", label = T)
+p2 <- FeaturePlot(CD19, "ratio", max.cutoff = cutoff)
+p3 <- ggplot(sketched, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point()
+p4 <- DimPlot(CD19, group.by = "cluster_anno_res.0.3")
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_QC_plots.pdf"), height = 9, width = 15)
+ggarrange(p1, p2, p3, p4)
+hist(CD19@meta.data$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off()
+```
+
+# singlet annotation
+```{r}
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "03_annotation/")), dir.create(paste0(plot.dir, "03_annotation/")), FALSE)
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_feature_plots.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(CD19, features = colnames(CD19@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19, features = colnames(CD19@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19, features = colnames(CD19@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19, features = colnames(CD19@meta.data)[c(22:27)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19, features = colnames(CD19@meta.data)[c(28:33)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19, features = colnames(CD19@meta.data)[c(34:38, 43)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots
+resolution <- c("pred_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+features <- Features(CD19)
+for (res in resolution) {
+  Idents(CD19) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots_", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(CD19, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# annotation
+CD19@meta.data <- mutate(CD19@meta.data, celltype = case_when(
+  pred_snn_res.0.3 == "0"~"B cells",
+  pred_snn_res.0.3 == "1"~"CD8+ CAR-T cells",
+  pred_snn_res.0.3 == "2"~"CD4+ T cells",
+  pred_snn_res.0.3 == "3"~"classical monocytes",
+  pred_snn_res.0.3 == "4"~"cDCs",
+  pred_snn_res.0.3 == "5"~"PICs", 
+  pred_snn_res.0.3 == "6"~"NK cells",
+  pred_snn_res.0.3 == "7"~"CD8+ T cells",
+  pred_snn_res.0.3 == "8"~"CD4+ CAR-T cells",
+  pred_snn_res.0.3 == "9"~"pDCs",
+  pred_snn_res.0.3 == "9.1"~"PICs",
+  pred_snn_res.0.3 == "10"~"granulocytes", 
+  pred_snn_res.0.3 == "11"~"non-classical monocytes",
+  pred_snn_res.0.3 == "12"~"PICs",
+  pred_snn_res.0.3 == "13"~"remove", # compensation problem 
+  pred_snn_res.0.3 == "14"~"neutrophils",
+  pred_snn_res.0.3 == "15"~"B cells",
+  pred_snn_res.0.3 == "16"~"B cells",
+  pred_snn_res.0.3 == "17"~"B cells", 
+  pred_snn_res.0.3 == "17.1"~"macrophages?", 
+  pred_snn_res.0.3 == "17.2"~"remove", 
+  pred_snn_res.0.3 == "18"~"remove", # high autofluoresence 
+  pred_snn_res.0.3 == "19"~"gdT cells",
+  pred_snn_res.0.3 == "20"~"B cells", 
+  pred_snn_res.0.3 == "21"~"remove", # compensation problem
+  pred_snn_res.0.3 == "22"~"B cells"
+))
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = CD19, file = paste0(data.dir, "obj_sketched_projected_annotated.rds"), destdir = paste0(data.dir, "/counts"))
+
+# remove unwanted clusters and recompute
+CD19_clean <- subset(CD19, subset = celltype != "remove")
+
+# repeat Seurat workflow
+DefaultAssay(CD19_clean) <- "sketch"
+resolution <- c(0.3,0.5,1,2)
+CD19_clean <- CD19_clean %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=33, approx=F) %>%
+    FindNeighbors(dims = 1:33) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:33, return.model = TRUE)
+
+# remove prior analyses from the meta.data to avoid confusion
+CD19_clean@meta.data <- CD19_clean@meta.data %>% 
+  dplyr::select(-c(sub.cluster.9, sub.cluster.17, sub.cluster, pred_snn_res.0.3, cluster_anno_res.0.3, celltype))
+
+# clean misc slot
+CD19_clean@misc <- list()
+
+# save cleaned object 
+SeuratObject::SaveSeuratRds(object = CD19_clean, file = paste0(data.dir, "obj_sketched_non_projected_cleaned.rds"), destdir = paste0(data.dir, "/counts"))
+```
+
+
+##################################
+# re-analyse high quality object #
+##################################
+
+
+# re-select doublet clusters
+```{r}
+# sketched cells 
+sketched <- CD19_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# clustering resolutions
+resolution <- c("sketch_snn_res.0.3", "sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+
+# clustree plot 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_clustree_all_events_clean.pdf"), height = 7, width = 14)
+clustree(CD19_clean %>% subset(cells = rownames(sketched)), prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+# ratio cluster plots and preliminary selection of doublet clusters
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events_clean.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  CD19_clean <- select_dbt(CD19_clean, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(CD19_clean, clusters = res))
+}
+dev.off()
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clusters_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+print(DimPlot(CD19_clean, reduction = 'umap', group.by = res, label = T) + 
+  labs(title = paste0(res)))
+}
+dev.off()
+
+# check clustering 
+Idents(CD19_clean) <- "sketch_snn_res.0.5"
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_highlighted_clusters_res.0.5_clean.pdf"), height = 7, width = 9, onefile = T)
+for (i in 0:24) {
+  print(DimPlot(CD19_clean, cells.highlight = WhichCells(CD19_clean, idents = as.character(i))))
+}
+dev.off()
+
+##########################
+##        choose        ##
+##  sketch_snn_res.0.5  ## 
+##                      ##
+##########################
+
+# # subcluster cluster 8, 23
+Idents(CD19_clean) <- 'sketch_snn_res.0.5'
+CD19_clean <- FindSubCluster(CD19_clean, cluster = "8", resolution = 0.1, graph.name = "sketch_snn", subcluster.name = "sub.cluster8")
+Idents(CD19_clean) <- 'sub.cluster8'
+CD19_clean <- FindSubCluster(CD19_clean, cluster = "23", resolution = 0.2, graph.name = "sketch_snn", subcluster.name = "sub.cluster")
+
+# # coerce subcluster names for project_data() to work 
+CD19_clean@meta.data <- CD19_clean@meta.data %>%
+  mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", "."))
+
+# project chosen clustering to all cells
+CD19_clean <- project_data(obj = CD19_clean,
+                     data_query = CD19_clean,
+                     ref_clusters = "sub.cluster",
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_snn_res.0.5",
+                     chunk_size=1000000,
+                     assay_ref = "sketch",
+                     assay_query = "FACS")
+
+# ratio cluster plot with projected clusters, including subclusters
+p1 <- CD19_clean@meta.data %>%  group_by(pred_snn_res.0.5, ratio_anno) %>% count(ratio_anno) %>% 
+    ggplot(aes(x = reorder(pred_snn_res.0.5, as.numeric(pred_snn_res.0.5), FUN = max), y = n, fill = ratio_anno)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_fill_manual(values = rev(c("orange2", "dodgerblue2"))) +
+    xlab("Clusters") +
+    labs(y = "Count") +
+    ggtitle("Cluster Analysis") +
+    theme_minimal()
+
+# # select doublet clusters
+CD19_clean <- select_dbt(CD19_clean, clusters = 'pred_snn_res.0.5', selected_clusters = "doublet_clusters", quantile = 0.8)
+CD19_clean <- select_dbt(CD19_clean, clusters = 'pred_snn_res.0.5', selected_clusters = "doublet_clusters", quantile = 0.85) 
+
+# pick 0.85 percentile
+dbts <- CD19_clean@misc$doublet_clusters_q0.85
+
+###########################################
+## doublet clusters: 8.1, 11, 13, 18, 19 ##
+###########################################
+
+# ratio cluster plot for all projected cells 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events_projected_clean.pdf"), height = 7, width = 14)
+p1
+dev.off()
+
+# export source data 
+write_xlsx(p1$data, paste0(plot.dir, "Extended_Data_Figure_4D_sourcedata.xlsx"))
+
+# add to meta.data
+CD19_clean@meta.data <- CD19_clean@meta.data %>%
+  mutate(cluster_anno = if_else(condition = as.character(pred_snn_res.0.5) %in% dbts,
+                                true = "doublet_cluster", false = "singlet_cluster"))
+
+# plot overall UMAP ----
+CD19_clean$umap_1 <- CD19_clean@reductions$umap@cell.embeddings[,1]
+CD19_clean$umap_2 <- CD19_clean@reductions$umap@cell.embeddings[,2]
+
+# number of colors
+num <- length(unique(CD19_clean@meta.data$pred_snn_res.0.5))
+# plot 
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_singletsUMAP_clustering.pdf"), height = 8, width = 10)
+CD19_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=pred_snn_res.0.5)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(pred_snn_res.0.5)),size=0.05, raster.dpi=700)+
+        scale_color_manual(values = smooth_rainbow(num, range = c(0.1, 0.99))) + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+# save obj
+SeuratObject::SaveSeuratRds(object = CD19_clean, file = paste0(data.dir, "obj_sketched_projected_cleaned.rds"), destdir = paste0(data.dir, "/counts"))
+```
+
+# repeat quality control
+```{r}
+# subset meta.data from sketched cells 
+sketched <- CD19_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_CARvsControl_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(CD19_clean, group.by = "condition") 
+dev.off()
+
+# by time
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_time_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(CD19_clean, group.by = "time") 
+dev.off()
+
+# check area/height ratio distribution and cutoff
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_ratio_histogram_clean.pdf"), height = 6, width = 8, onefile = T)
+hist(CD19_clean@meta.data$ratio, breaks = 2000)
+cutoff <- calculateThreshold(hist(CD19_clean@meta.data$ratio, breaks = 2000, plot = F))
+abline(v=cutoff) 
+dev.off()  
+
+# plot some QC plots together as a summary
+cutoff <- calculateThreshold(hist(CD19_clean@meta.data$ratio, breaks = 2000, plot = F))
+p1 <- DimPlot(CD19_clean, group.by = "pred_snn_res.0.5", label = T)
+p2 <- FeaturePlot(CD19_clean, "ratio", max.cutoff = cutoff)
+p3 <- ggplot(sketched, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point()
+p4 <- DimPlot(CD19_clean, group.by = "cluster_anno")
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_QC_plots_clean.pdf"), height = 9, width = 15)
+ggarrange(p1, p2, p3, p4)
+hist(CD19_clean@meta.data$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off()
+
+# supplement QC figures 
+CD19_clean@meta.data <- CD19_clean@meta.data %>% mutate(unscaled_ratio = FSC.A / FSC.H) # ratio not scaled to 0-1023
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_FSCratio_histogram.pdf"), height = 7, width = 4.5)
+gghistogram(CD19_clean@meta.data, x = "unscaled_ratio", fill = "ratio_anno", bins = 2000, linetype = "blank") + scale_fill_manual(values = rev(c("orange2", "dodgerblue2")))  # histogram 
+dev.off()
+
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_FSCratio_dimplot.pdf"), height = 8, width = 10)
+CD19_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=ratio_anno)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700) +
+        ggrastr::geom_point_rast(aes(color=as.factor(ratio_anno)),size=0.05, raster.dpi=700) +
+        scale_color_manual(values = rev(c("orange2", "dodgerblue2")))  + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+```
+
+# high quality singlet annotation
+```{r}
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_feature_plots_clean.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(CD19_clean, features = colnames(CD19_clean@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19_clean, features = colnames(CD19_clean@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19_clean, features = colnames(CD19_clean@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19_clean, features = colnames(CD19_clean@meta.data)[c(22:27)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19_clean, features = colnames(CD19_clean@meta.data)[c(28:33)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(CD19_clean, features = colnames(CD19_clean@meta.data)[c(34:38, 43)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots
+resolution <- c("sketch_snn_res.0.3", "pred_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2")
+features <- Features(CD19_clean)
+for (res in resolution) {
+  Idents(CD19_clean) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots_", res, "_clean.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(CD19_clean, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# MEM heatmap
+MEM_heatmap(obj = CD19_clean, markers = colnames(CD19_clean@meta.data)[c(4:6,9,11:37,43,54)], cluster_col = "pred_snn_res.0.5")
+
+# annotation ----
+CD19_clean@meta.data <- mutate(CD19_clean@meta.data, celltype = case_when(
+  pred_snn_res.0.5 == "0"~"B cells", 
+  pred_snn_res.0.5 == "1"~"CD8+CAR-T cells",
+  pred_snn_res.0.5 == "2"~"B cells",
+  pred_snn_res.0.5 == "3"~"CD4+T cells",
+  pred_snn_res.0.5 == "4"~"classical monocytes",
+  pred_snn_res.0.5 == "5"~"NK cells", 
+  pred_snn_res.0.5 == "6"~"cDCs",
+  pred_snn_res.0.5 == "7"~"CD4+CAR-T cells",
+  pred_snn_res.0.5 == "8"~"pDCs",
+  pred_snn_res.0.5 == "8.1"~"PICs",
+  pred_snn_res.0.5 == "9"~"granulocytes",
+  pred_snn_res.0.5 == "10"~"CD8+T cells", 
+  pred_snn_res.0.5 == "11"~"PICs",
+  pred_snn_res.0.5 == "12"~"non-classical monocytes",
+  pred_snn_res.0.5 == "13"~"PICs", 
+  pred_snn_res.0.5 == "14"~"cDCs",
+  pred_snn_res.0.5 == "15"~"CD8+T cells",
+  pred_snn_res.0.5 == "16"~"B cells",
+  pred_snn_res.0.5 == "17"~"neutrophils", 
+  pred_snn_res.0.5 == "18"~"PICs", 
+  pred_snn_res.0.5 == "19"~"PICs",
+  pred_snn_res.0.5 == "20"~"B cells",
+  pred_snn_res.0.5 == "21"~"B cells", 
+  pred_snn_res.0.5 == "22"~"gdT cells",
+  pred_snn_res.0.5 == "23"~"basophils",
+  pred_snn_res.0.5 == "23.1"~"CD41+",
+  pred_snn_res.0.5 == "23.2"~"CD41+",
+  pred_snn_res.0.5 == "24"~"macrophage-like"
+))
+
+# plot
+DimPlot(CD19_clean, group.by = "celltype", label =T)
+
+# MEM heatmap annotated ----
+# create numerical values for the celltype annotation
+MEM <- CD19_clean@meta.data %>% 
+  dplyr::select(c(FSC.A:SSC.A, SSC.H, CD41:F4.80, celltype)) %>% 
+  mutate(cluster = as.numeric(factor(celltype, levels = unique(celltype))))
+
+# key
+celltype_anno <- unique(CD19_clean$celltype)
+
+# calculation of MEM scores
+MEM_values <-MEM(MEM[,c(1:31,33)],
+                 transform = F,
+                 choose.markers = F,
+                 markers = "all",
+                 choose.ref = F,
+                 zero.ref = F,
+                 IQR.thresh = NULL)
+
+# turn numerical cluster label back to celltype annotations 
+heatmap <- as.data.frame(MEM_values$MEM_matrix[[1]])
+
+cols <- colorRamp2(seq(from = -10, to = 10, length.out = 100), pals::coolwarm(100))
+h1 <- Heatmap(t(as.matrix(heatmap)),
+        hcl.colors(100, "Blue-Red 3"),
+        name = "MEM enrichment score",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "ward.D2",
+        column_title = "clusters", 
+        row_title = "markers",
+        column_labels = celltype_anno,
+        row_names_gp = gpar(fontsize = 9),
+        column_names_gp = gpar(fontsize = 9),
+        show_row_names = T,
+        cluster_rows = T,
+        cluster_columns = T,
+        show_parent_dend_line = FALSE,
+        width = ncol(heatmap)*unit(2.2, "mm"), 
+        height = nrow(heatmap)*unit(7, "mm"))
+
+# plot heatmap ----
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_singlets_MEMheatmap.pdf"), height = 7, width = 7)
+print(h1)
+dev.off()
+
+# export source data
+colnames(h1@matrix) <- h1@column_names_param$labels
+write_xlsx(as.data.frame(h1@matrix) %>% rownames_to_column(var = "marker"), paste0(plot.dir, "Extended_Data_Figure_4F_sourcedata.xlsx"))
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = CD19_clean, file = paste0(data.dir, "obj_sketched_projected_cleaned_annotated.rds"), destdir = paste0(data.dir, "/counts"))
+```
+
+# doublet annotation
+```{r}
+# subset doublet clusters 
+DefaultAssay(CD19_clean) <- 'FACS'
+dbts_CD19 <- subset(CD19_clean, subset = cluster_anno == "doublet_cluster") 
+
+# new assay 
+dbts_CD19[["dbts"]] <- CreateAssay5Object(counts = dbts_CD19@assays$FACS$counts, data = dbts_CD19@assays$FACS$data)
+DefaultAssay(dbts_CD19) <- "dbts"
+
+# repeat seurat workflow
+resolution <- c(0.3, 0.5, 1)
+
+dbts_CD19 <- dbts_CD19 %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=33, approx=F) %>%
+    FindNeighbors(dims = 1:33) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:33, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_CD19, file = paste0(data.dir, "obj_doublets.rds"))
+
+# plots 
+ifelse(!dir.exists(paste0(plot.dir, "04_doublet_annotation/")), dir.create(paste0(plot.dir, "04_doublet_annotation/")), FALSE)
+
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_dimplot_clusters_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_CD19, reduction = 'umap', group.by = paste0("dbts_snn_res.", res), label = T))
+}
+dev.off()
+
+# clustree
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_clustree_doublets.pdf"), height = 7, width = 14)
+clustree(dbts_CD19, prefix = "dbts_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+##################
+##   choose     ##
+##   res 1      ##
+##################
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_feature_plots_doublets.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(dbts_CD19, features = colnames(dbts_CD19@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19, features = colnames(dbts_CD19@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19, features = colnames(dbts_CD19@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19, features = colnames(dbts_CD19@meta.data)[c(22:27)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19, features = colnames(dbts_CD19@meta.data)[c(28:33)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19, features = colnames(dbts_CD19@meta.data)[c(34:38,43)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# subcluster cluster 7, 14, 13
+Idents(dbts_CD19) <- 'dbts_snn_res.1'
+dbts_CD19 <- FindSubCluster(dbts_CD19, cluster = "7", resolution = 0.1, graph.name = "dbts_snn", subcluster.name = "sub.cluster")
+Idents(dbts_CD19) <- 'sub.cluster'
+dbts_CD19 <- FindSubCluster(dbts_CD19, cluster = "14", resolution = 0.1, graph.name = "dbts_snn", subcluster.name = "sub.cluster")
+Idents(dbts_CD19) <- 'sub.cluster'
+dbts_CD19 <- FindSubCluster(dbts_CD19, cluster = "13", resolution = 0.1, graph.name = "dbts_snn", subcluster.name = "sub.cluster")
+
+# ridge plots 
+features <- Features(dbts_CD19)
+Idents(dbts_CD19) <- "dbts_snn_res.1"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_res.1.pdf"), height = 8, width = 5, onefile = T)
+for (f in features) {
+  print(RidgePlot(dbts_CD19, features = f, slot = 'data'))
+}
+dev.off()
+
+# subclustered ridge plots
+features <- Features(dbts_CD19)
+Idents(dbts_CD19) <- "sub.cluster"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_subclustered.pdf"), height = 8, width = 5, onefile = T)
+for (f in features) {
+  print(RidgePlot(dbts_CD19, features = f, slot = 'data'))
+}
+dev.off()
+
+# MEM hetmaps 
+MEM_heatmap(obj = dbts_CD19, markers = colnames(dbts_CD19@meta.data)[c(4:6,9,11:37,43,61)], cluster_col = "dbts_snn_res.1", scale_height = 10)
+
+# annotation
+dbts_CD19@meta.data <- mutate(dbts_CD19@meta.data, doublet_type = case_when(
+  dbts_snn_res.1 == "0"~"B*B",
+  dbts_snn_res.1 == "1"~"B*CD4+CAR-T",
+  dbts_snn_res.1 == "2"~"B*B",
+  dbts_snn_res.1 == "3"~"myeloid*myeloid",
+  dbts_snn_res.1 == "4"~"B*CD8+CAR-T",
+  dbts_snn_res.1 == "5"~"B*CD4+T",
+  dbts_snn_res.1 == "6"~"CD45low", 
+  sub.cluster == "7_0"~"B*NK",
+  sub.cluster == "7_1"~"B*CD8+T",
+  dbts_snn_res.1 == "8"~"B*myeloid*NK",
+  dbts_snn_res.1 == "9"~"CD4*CD4",
+  dbts_snn_res.1 == "10"~"CD45low",
+  dbts_snn_res.1 == "11"~"CD4*myeloid",
+  dbts_snn_res.1 == "12"~"B*myeloid",
+  sub.cluster == "13_0"~"pDC",
+  sub.cluster == "13_1"~"B*pDC",
+  sub.cluster == "14_0"~"CD4*CD8",
+  sub.cluster == "14_1"~"CD8*CD8",
+  dbts_snn_res.1 == "15"~"B*B?",
+  dbts_snn_res.1 == "16"~"B*B?",
+  dbts_snn_res.1 == "17"~"CD45low", # high autofluoresence
+  dbts_snn_res.1 == "18"~"remove" # high autofluoresence
+))
+
+# save annotated obj 
+SeuratObject::SaveSeuratRds(object = dbts_CD19, file = paste0(data.dir, "obj_doublets_annotated.rds"))
+
+# keep high quality, heterotypic clusters  
+keep <- c("B*NK", "B*CD4+T", "CD4*myeloid", "B*CD8+CAR-T", "B*pDC", "B*myeloid*NK", "B*myeloid", "B*CD8+T", "CD4*CD8", "B*CD4+CAR-T")
+dbts_CD19_clean <- subset(dbts_CD19, subset = doublet_type %in% keep)
+
+# remove old meta.data column to avoid confusion
+dbts_CD19_clean@meta.data <- dbts_CD19_clean@meta.data %>% 
+  dplyr::select(-c(dbts_snn_res.0.3, dbts_snn_res.0.5, dbts_snn_res.1, sub.cluster8, sub.cluster , doublet_type))
+
+# repeat Seurat workflow
+resolution <- c(0.3, 0.5, 1)
+
+dbts_CD19_clean <- dbts_CD19_clean %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=33, approx=F) %>%
+    FindNeighbors(dims = 1:33) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:33, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_CD19_clean, file = paste0(data.dir, "obj_doublets_clean.rds"))
+
+# plot
+DimPlot(dbts_CD19_clean, group.by = "dbts_snn_res.1", label =T)
+
+# annotation plots ----
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_dimplot_clusters_doublets_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_CD19_clean, reduction = 'umap', group.by = paste0("dbts_snn_res.", res), label = T))
+}
+dev.off()
+
+# clustree
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_clustree_doublets_clean.pdf"), height = 7, width = 14)
+clustree(dbts_CD19_clean, prefix = "dbts_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_feature_plots_doublets_clean.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(dbts_CD19_clean, features = colnames(dbts_CD19_clean@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19_clean, features = colnames(dbts_CD19_clean@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19_clean, features = colnames(dbts_CD19_clean@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19_clean, features = colnames(dbts_CD19_clean@meta.data)[c(22:27)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19_clean, features = colnames(dbts_CD19_clean@meta.data)[c(28:33)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_CD19_clean, features = colnames(dbts_CD19_clean@meta.data)[c(34:38,43)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+##################
+##   choose     ##
+##   res 1      ##
+##################
+
+# ridge plots 
+features <- Features(dbts_CD19_clean)
+Idents(dbts_CD19_clean) <- "dbts_snn_res.1"
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_res1_clean.pdf"), height = 8, width = 5, onefile = T)
+for (f in features) {
+  print(RidgePlot(dbts_CD19_clean, features = f, slot = 'data'))
+}
+dev.off()
+
+# MEM heatmap
+MEM_heatmap(obj = dbts_CD19_clean, markers = colnames(dbts_CD19_clean@meta.data)[c(4:6,9,11:37,43,59)], cluster_col = "dbts_snn_res.1", scale_height = 14)
+
+# subcluster cluster 4
+Idents(dbts_CD19_clean) <- "dbts_snn_res.1"
+dbts_CD19_clean <- FindSubCluster(dbts_CD19_clean, cluster = "4", resolution = 0.2, subcluster.name = "sub.cluster", graph.name = "dbts_snn")
+Idents(dbts_CD19_clean) <- "sub.cluster"
+
+# annotation
+dbts_CD19_clean@meta.data <- mutate(dbts_CD19_clean@meta.data, doublet_type = case_when(
+  dbts_snn_res.1 == "0"~"B*CD4+CAR-T",
+  dbts_snn_res.1 == "1"~"B*CD8+CAR-T",
+  dbts_snn_res.1 == "2"~"B*CD4+T",
+  dbts_snn_res.1 == "3"~"B*myeloid",
+  sub.cluster == "4_0"~"B*CD4+CAR-T", 
+  sub.cluster == "4_1"~"B*CD8+CAR-T",
+  dbts_snn_res.1 == "5"~"CD4+T*myeloid",
+  dbts_snn_res.1 == "6"~"B*CD8+T",
+  dbts_snn_res.1 == "7"~"B*myeloid", 
+  dbts_snn_res.1 == "8"~"B*NK", 
+  dbts_snn_res.1 == "9"~"CD4+T*CD8+T",
+  dbts_snn_res.1 == "10"~"B*pDC"
+))
+
+# plot
+DimPlot(dbts_CD19_clean, group.by = "doublet_type", label =T)
+DimPlot(dbts_CD19_clean, group.by = "doublet_type", label =T, split.by = "condition")
+
+# annotated heatmap for supplements
+# calculate MEM scores ----
+MEM <- dbts_CD19_clean@meta.data %>% 
+  dplyr::select(c(FSC.A:SSC.A, SSC.H, CD41:F4.80, doublet_type)) %>% 
+  mutate(cluster = as.numeric(factor(doublet_type, levels = unique(doublet_type)))) # turn doublet_types into ID numbers since MEM can't deal with strings 
+
+# key
+doublet_type_anno <- unique(dbts_CD19_clean$doublet_type)
+
+# calculation of MEM scores
+MEM_values <-MEM(MEM[,c(1:31,33)],
+                 transform = F,
+                 choose.markers = F,
+                 markers = "all",
+                 choose.ref = F,
+                 zero.ref = F,
+                 IQR.thresh = NULL)
+
+# heatmap with douublet type anno labels
+heatmap <- as.data.frame(MEM_values$MEM_matrix[[1]])
+cols <- colorRamp2(seq(from = -10, to = 10, length.out = 100), pals::coolwarm(100))
+h2 <- Heatmap(t(as.matrix(heatmap)),
+        hcl.colors(100, "Blue-Red 3"),
+        name = "MEM enrichment score",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "ward.D2",
+        column_title = "clusters", 
+        row_title = "markers",
+        column_labels = doublet_type_anno,
+        row_names_gp = gpar(fontsize = 9),
+        column_names_gp = gpar(fontsize = 9),
+        show_row_names = T,
+        cluster_rows = T,
+        cluster_columns = T,
+        show_parent_dend_line = FALSE,
+        width = ncol(heatmap)*unit(1, "mm"), 
+        height = nrow(heatmap)*unit(15, "mm"))
+
+# plot heatmap ----
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_doublets_MEMheatmap.pdf"), height = 7, width = 7)
+print(h2)
+dev.off()
+
+# export source data
+colnames(h2@matrix) <- h2@column_names_param$labels
+write_xlsx(as.data.frame(h2@matrix) %>% rownames_to_column(var = "marker"), paste0(plot.dir, "Extended_Data_Figure_4I_sourcedata.xlsx"))
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_CD19_clean, file = paste0(data.dir, "obj_doublets_clean_annotated.rds"))
+```
+
+# plotting
+```{r}
+# singlet UMAP 
+colors <- c("cDCs" = "#805C75", 
+            "B cells" = "#4B65BE",
+            "CD8+ T cells" = "#7AA1A7",
+            "CD4+ T cells" = "#609162",
+            "neutrophils" = "#EAC446", 
+            "classical monocytes" = "#A26272", 
+            "non-classical monocytes" = "#CF8694", 
+            "NK cells" = "#7C5FA1",
+            "pDCs" = "#743182", 
+            "PICs" = "#ED8706", 
+            "granulocytes" = "#E4BC78", 
+            "gdT cells" = "#3F426A", 
+            "CD8+ CAR-T cells" = "#2C6685",
+            "CD41+" = "#989E96",
+            "macrophage-like" = "#A52E41",
+            "CD4+ CAR-T cells" = "#3A5743",
+            "basophils" = "#CFDF9F")
+
+# without labels 
+CD19_clean$umap_1 <- CD19_clean@reductions$umap@cell.embeddings[,1]
+CD19_clean$umap_2 <- CD19_clean@reductions$umap@cell.embeddings[,2]
+
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_CAR-T_singletsUMAP.pdf"), height = 8, width = 10)
+CD19_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=celltype)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(celltype)),size=0.05, raster.dpi=700)+
+        scale_color_manual(values=colors)+theme_classic()+
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+
+# supplement figure features
+Feature_Plot <- FeaturePlot(CD19_clean, features=colnames(CD19_clean@meta.data)[c(4:6,9,11:37, 43)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 1.5)
+for(i in 1:length(Feature_Plot)) suppressMessages({
+  Feature_Plot[[i]] <- Feature_Plot[[i]] + 
+    scale_colour_gradientn(colours = pals::parula(n = 100)) +
+    theme_classic() +
+    NoLegend() + 
+    NoAxes()
+})
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_singletsUMAP_features.pdf"), height = 8, width = 7)
+print(cowplot::plot_grid(plotlist = Feature_Plot, nrow = 7))
+dev.off()
+
+# density for the supplements
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_density_all_timepoints_singlets.pdf"), height = 5, width = 5)
+ggplot(CD19_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.2, method = "auto") + 
+  facet_wrap(~time, ncol = 5) + scale_color_viridis() + theme_classic()
+dev.off()
+
+# doublet UMAP -----
+dbts_CD19_clean <- dbts_CD19_clean %>% 
+    RunUMAP(dims = 1:33, return.model = TRUE, min.dist = 0.05, reduction.name = "UMAP_tight2")
+
+colors <- c("B*CD4+CAR-T" = "#59A25E",
+            "B*CD8+CAR-T" = "#164863",
+            "CD4*myeloid" = "#C5E898", 
+            "B*myeloid" = "#B53979",
+            "B*CD4+T" = "#427D9D", 
+            "B*CD8+T" = "#071952", 
+            "B*NK" = "#813A54", 
+            "CD4*CD8" = "#9EC8B9", 
+            "B*pDC" = "#574E9A")
+
+# UMAP
+dbts_CD19_clean$umap_1 <- dbts_CD19_clean@reductions$umap@cell.embeddings[,1]
+dbts_CD19_clean$umap_2 <- dbts_CD19_clean@reductions$umap@cell.embeddings[,2]
+
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_CAR-T_doubletsUMAP.pdf"), height = 8, width = 10)
+dbts_CD19_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=doublet_type)) +
+        ggrastr::geom_point_rast(size=2,color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(doublet_type)),size=1.5, raster.dpi=700)+
+        scale_color_manual(values=colors)+theme_classic()+
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+    
+# densities
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_CAR-T_doubletsUMAP_densities.pdf"), height = 8, width = 10)
+ggplot(dbts_CD19_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.5, raster.dpi=700, method = "auto") + 
+  facet_wrap(~condition) + scale_color_viridis() + theme_classic()
+dev.off()
+
+# density for the supplements
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_density_all_timepoints_doublets.pdf"), height = 5, width = 15)
+ggplot(dbts_CD19_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.2, method = "auto") + 
+  facet_wrap(~time, ncol = 5) + scale_color_viridis() + theme_classic()
+dev.off()
+
+# supplement figure features
+Feature_Plot <- FeaturePlot(dbts_CD19_clean, features=colnames(dbts_CD19_clean@meta.data)[c(4:6,9,11:37, 43)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 2.5)
+for(i in 1:length(Feature_Plot)) suppressMessages({
+  Feature_Plot[[i]] <- Feature_Plot[[i]] + 
+    scale_colour_gradientn(colours = pals::parula(n = 100)) +
+    theme_classic() +
+    NoLegend() + 
+    NoAxes()
+})
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_doubletsUMAP_features.pdf"), height = 8, width = 7)
+print(cowplot::plot_grid(plotlist = Feature_Plot, nrow = 7))
+dev.off()
+```
+
+# quantification / normalization
+```{r}
+# singlet cell types 
+cell_num <- as.data.frame(table(CD19_clean$celltype, CD19_clean$sample)) %>% 
+  pivot_wider(names_from = Var2, values_from = Freq) %>% 
+  column_to_rownames("Var1")
+
+# total cell numbers per sample, only removing low quality clusters 
+sample_total <- as.data.frame(table(CD19$pred_snn_res.0.3, CD19$sample)) %>% 
+  pivot_wider(names_from = Var2, values_from = Freq) %>% 
+  dplyr::filter(!Var1 %in% c("13","17.2", "18", "21")) %>% # see CD19 singlet annotation above 
+  summarise(across(2:17, sum))
+
+# extract cluster sizes per condition, sample 
+fc_CD19 <- dbts_CD19_clean@meta.data %>% 
+  group_by(doublet_type, condition, sample, time) %>% 
+  count() %>% 
+  dplyr::filter(doublet_type %in% c("B*CD4+CAR-T", "B*CD8+CAR-T", "B*CD4+T", "B*CD8+T")) %>% 
+  mutate(doublet_type = factor(doublet_type, levels = c("B*CD4+T", "B*CD4+CAR-T", "B*CD8+T", "B*CD8+CAR-T"))) 
+
+# total cell numbers per sample (only removing low quality cells)
+fc_CD19$total <- 0
+for (n in 1:nrow(fc_CD19)) {
+  fc_CD19$total[n] <- sample_total[[fc_CD19$sample[n]]]
+}
+
+# quantify frequencies and enrichment 
+fc_CD19 <- fc_CD19 %>% 
+  mutate(freqAB = n / total) %>% # calculate frequency based on number of quality cells in that sample 
+  mutate(celltypeA = str_extract(doublet_type, "(.*)\\*", group = 1)) %>% # extract first interacting celltype 
+  mutate(celltypeB = str_extract(doublet_type, "\\*(.*)", group = 1)) %>% # extract second interacting cell type 
+  mutate(n_celltypeA = cell_num[str_detect(rownames(cell_num), str_replace(celltypeA, "\\+", "\\\\+")), sample]) %>% # find corresponding number of the celltype in the cell_num table  (per sample)
+  mutate(n_celltypeB = cell_num[str_detect(rownames(cell_num), str_replace(celltypeB, "\\+", "\\\\+")), sample]) %>% 
+  mutate(freqA = n_celltypeA / total) %>% # calculate celltype frequencies 
+  mutate(freqB = n_celltypeB / total) %>% 
+  mutate(eAB = freqAB / ((2*freqA*freqB)/freqA+freqB)) # enrichment term based on the harmonic mean 
+
+# split in CD4+ and CD8+ T cells 
+fc_CD4 <- fc_CD19 %>% dplyr::filter(doublet_type %in% c("B*CD4+T", "B*CD4+CAR-T"))
+fc_CD8 <- fc_CD19 %>% dplyr::filter(doublet_type %in% c("B*CD8+T", "B*CD8+CAR-T"))
+
+
+# final quantification plots (time  = 1h) ----
+
+############
+#   CD4    #
+############
+
+# stats 
+# test for normality
+fc_CD4 %>% 
+  dplyr::filter(condition == "CAR", time == 1) %>% 
+  group_by(doublet_type) %>% 
+  shapiro_test(eAB) # normality can be assumed (but n = 4 so very limited)
+
+# paired t test 
+stat.test_CD4 <- fc_CD4 %>% dplyr::filter(condition == "CAR", time == 1) %>%
+  ungroup() %>% 
+  t_test(eAB ~ doublet_type, paired = TRUE) %>%
+  add_significance() %>% 
+  add_xy_position()
+
+# plot individual points instead of boxplots 
+p1 <- ggstripchart(fc_CD4 %>% dplyr::filter(condition == "CAR", time == 1), 
+             x = "doublet_type", y = "eAB",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "doublet_type", 
+             jitter = 0.2, size = 6, 
+             add.params = list(color = "black"), shape = 21) + 
+    theme_classic() +
+    theme(legend.position = "none") + 
+    scale_fill_manual(values = colors) + 
+    stat_pvalue_manual(stat.test_CD4, label = "p.signif", y.position = c(0.08), tip.length = 0.01) + 
+    scale_y_continuous(limits = c(0,0.0825)) + 
+    stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+                 geom = "errorbar", color = "black", width = 0.3, size = 0.5) + 
+    geom_line(aes(group = sample), position = position_jitter(width = 0.25))
+
+# save as pdf 
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_stripchart_CD4.pdf"), height = 8, width = 11)  
+print(p1)
+dev.off() 
+
+# export source data 
+write_xlsx(p1$data, paste0(plot.dir, "Figure_3E_sourcedata_CD4.xlsx"))
+
+# all time points for the supplements
+fc_CD4 %>% 
+    dplyr::filter(condition == "CAR") %>% 
+    group_by(doublet_type, time) %>% 
+    shapiro_test(eAB) # normality can be assumed 
+
+# stats
+stat.test_CD4 <- fc_CD4 %>% dplyr::filter(condition == "CAR") %>%
+  group_by(time) %>% 
+  t_test(eAB ~ doublet_type, paired = TRUE) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% 
+  add_xy_position()
+
+# plot stripchart 
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_stripchart_all_timepoints_CD4.pdf"), height = 5, width = 15)  
+p1.1 <- ggstripchart(fc_CD4 %>% dplyr::filter(condition == "CAR"), 
+             x = "doublet_type", y = "eAB",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "doublet_type", 
+             jitter = 0.2, size = 6, 
+             add.params = list(color = "black"), shape = 21) +   
+  facet_wrap(~time, ncol = 4) +  
+  scale_fill_manual(values = colors) + 
+  stat_pvalue_manual(stat.test_CD4, label = "p.adj.signif", y.position = c(0.08), tip.length = 0.01) + 
+  theme_classic() +
+  theme(legend.position = "none") + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5) + 
+  geom_line(aes(group = sample), position = position_jitter(width = 0.25))
+print(p1.1)
+dev.off()
+
+# export source data 
+write_xlsx(p1.1$data, paste0(plot.dir, "Extended_Data_Figure_4_sourcedata_CD4.xlsx"))
+
+
+############
+#   CD8    #
+############
+
+# stats 
+# test for normality
+fc_CD8 %>% 
+  dplyr::filter(condition == "CAR", time == 1) %>% 
+  group_by(doublet_type) %>% 
+  shapiro_test(eAB) # normality can be assumed (but n = 4 so very limited)
+
+# paired t test 
+stat.test_CD8 <- fc_CD8 %>% dplyr::filter(condition == "CAR", time == 1) %>%
+  mutate(doublet_type = factor(doublet_type)) %>% 
+  ungroup() %>%  
+  t_test(eAB ~ doublet_type, paired = TRUE) %>%
+  add_significance() %>% 
+  add_xy_position()
+
+# plot individual points instead of boxplots 
+p2 <- ggstripchart(fc_CD8 %>% dplyr::filter(condition == "CAR", time == 1), 
+             x = "doublet_type", y = "eAB",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "doublet_type", 
+             jitter = 0.2, size = 6, 
+             add.params = list(color = "black"), shape = 21) + 
+    theme_classic() +
+    theme(legend.position = "none") + 
+    scale_fill_manual(values = colors) + 
+    stat_pvalue_manual(stat.test_CD8, label = "p.signif", y.position = c(0.016), tip.length = 0.01) + 
+    scale_y_continuous(limits = c(0,0.0165), breaks = c(0, 0.004, 0.008, 0.012, 0.016)) + 
+    stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+                 geom = "errorbar", color = "black", width = 0.3, size = 0.5) + 
+    geom_line(aes(group = sample), position = position_jitter(width = 0.25))
+
+# save as pdf 
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_stripchart_CD8.pdf"), height = 8, width = 11)  
+print(p2)
+dev.off() 
+
+# export source data 
+write_xlsx(p2$data, paste0(plot.dir, "Figure_3E_sourcedata_CD8.xlsx"))
+
+# plot stripcharts together 
+pdf(paste0(plot.dir, Sys.Date(), "_CD19-CAR_T_stripchart.pdf"), height = 3.25, width = 5.5)
+ggarrange(p1, p2)
+dev.off()
+
+# all timepoints for the supplements
+fc_CD8 %>% 
+    dplyr::filter(condition == "CAR") %>% 
+    group_by(doublet_type, time) %>% 
+    shapiro_test(eAB) # normality can be assumed
+
+# stats
+stat.test_CD8 <- fc_CD8 %>% dplyr::filter(condition == "CAR") %>%
+  group_by(time) %>% 
+  t_test(eAB ~ doublet_type, paired = TRUE) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% 
+  add_xy_position() %>%
+  mutate(xmin = rep(1)) %>% 
+  mutate(xmax = rep(2))
+
+# plot stripchart 
+pdf(paste0(plot.dir, Sys.Date(), "_CD19_stripchart_all_timepoints_CD8.pdf"), height = 5, width = 15)  
+p2.1 <- ggstripchart(fc_CD8 %>% dplyr::filter(condition == "CAR"), 
+             x = "doublet_type", y = "eAB",  add = "mean_sd", 
+             error.plot = "errorbar", fill = "doublet_type", 
+             jitter = 0.2, size = 6, 
+             add.params = list(color = "black"), shape = 21) +   
+  facet_wrap(~time, ncol = 4) +  
+  scale_fill_manual(values = colors) + 
+  stat_pvalue_manual(stat.test_CD8, label = "p.adj.signif", y.position = c(0.0155), tip.length = 0.01) + 
+  theme_classic() +
+  theme(legend.position = "none") + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5) + 
+  geom_line(aes(group = sample), position = position_jitter(width = 0.25))
+print(p2.1)
+dev.off()
+
+# export source data 
+write_xlsx(p2.1$data, paste0(plot.dir, "Extended_Data_Figure_4_sourcedata_CD8.xlsx"))
+```
+
+
+# export obj as data.frames for publication 
+```{r}
+# OVERALL CELLULAR LANDSCAPE --------------------------------------------------------
+# add umap values 
+CD19_clean$umap_1 <- CD19_clean@reductions$umap@cell.embeddings[,1]
+CD19_clean$umap_2 <- CD19_clean@reductions$umap@cell.embeddings[,2]
+
+overall <- CD19_clean@meta.data %>% 
+  # remove columns for clustering solutions, Seurat object columns, live-dead column, and flow cytometer acquisition_time
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, acquisition_time,
+                   sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1,
+                   sketch_snn_res.2, seurat_clusters, sub.cluster8, sub.cluster)) %>% 
+  rename(GFP = CAR)
+
+# save as csv
+write_csv(overall, file = paste0(data.dir, Sys.Date(), "_CD19-CAR-T_overall_landscape.csv"), 
+          col_names = T, quote = "all")
+
+
+# INTERACTING LANDSCAPE --------------------------------------------------------
+dbts <- dbts_CD19@meta.data %>% 
+  # filter low quality clusters, but keep homotypic interactions 
+  dplyr::filter(!dbts_snn_res.1 %in% c("18")) %>% 
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, acquisition_time, 
+                   sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1, 
+                   sketch_snn_res.2, seurat_clusters, sub.cluster8, sub.cluster,
+                   pred_snn_res.0.5, cluster_anno, celltype, nCount_dbts,
+                   nFeature_dbts, dbts_snn_res.0.3, dbts_snn_res.0.5, dbts_snn_res.1,
+                   doublet_type)) %>% 
+  rename(GFP = CAR) 
+
+# final overall landscape data 
+# add umap values 
+dbts_CD19_clean$umap_1 <- dbts_CD19_clean@reductions$umap@cell.embeddings[,1]
+dbts_CD19_clean$umap_2 <- dbts_CD19_clean@reductions$umap@cell.embeddings[,2]
+
+dbts_final <- dbts_CD19_clean@meta.data %>%
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, LD, acquisition_time, 
+                   sketch_snn_res.0.3, sketch_snn_res.0.5, sketch_snn_res.1,
+                   sketch_snn_res.2, seurat_clusters, pred_snn_res.0.5, celltype,
+                   nCount_dbts, nFeature_dbts, dbts_snn_res.0.3, dbts_snn_res.0.5, 
+                   dbts_snn_res.1)) %>% 
+  rename(dbts_snn_res.1 = sub.cluster, interaction = doublet_type, GFP = CAR)
+
+# make sure all values except clustering, doublet type and umap_1/2 are the same 
+identical(dbts[rownames(dbts_final),], dbts_final[,c(1:41)]) # yes 
+
+# join
+interacting_landscape <- left_join(dbts, dbts_final)
+
+# save as csv
+write_csv(interacting_landscape, file = paste0(data.dir, Sys.Date(), "_CD19-CAR-T_interacting_landscape.csv"), 
+          col_names = T, quote = "all")
+```

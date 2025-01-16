@@ -1,0 +1,961 @@
+---
+title: "Analysis OT-II OVA Experiment"
+output: html_notebook
+author: "Viktoria Flore"
+date: "2024-01-15"
+---
+
+This is the analysis script for the co-cultures of chicken ovalbumin (OVA)
+specific OT-II CD4 T cells with murine splenocytes in Vonficht, Jopp-Saile, 
+Yousefian, Flore et al. Ultra-high scale cytometry-based cellular interaction 
+mapping, Nature Methods (2025). Pre-processed csv files can be found on Zenodo
+at https://doi.org/10.5281/zenodo.10637096.
+
+# load packages and set paths 
+```{r results='hide', message=FALSE, warning=FALSE}
+library(Seurat)
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 2e9)
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(readr)
+library(BPCells)
+library(pals)
+library(tidyverse)
+library(dplyr)
+library(rstatix)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsci)
+library(ggrastr)
+library(khroma)
+library(pbapply)
+library(viridis)
+library(MASS)
+library(clustree)
+library(ggrepel)
+library(ggpointdensity)
+library(cytoMEM)
+library(ComplexHeatmap)
+library(circlize)
+library(writexl)
+library(PICtR) # version 0.1.0
+
+dir <- "./ovalbumin/"
+data.dir <- "./ovalbumin/data/"
+plot.dir <- "./ovalbumin/plots/"
+input.dir <- "./ovalbumin/csv_files/"
+
+# create directory structure if not already present 
+for (d in c(data.dir, plot.dir)) {
+  ifelse(!dir.exists(d), dir.create(d), FALSE)
+}
+
+# experiment 
+exp <- "OVA"
+```
+
+# OVA data
+```{r, message=FALSE, warning=FALSE}
+# find channel values csv files 
+files <- dir(paste0(input.dir), pattern="*.csv")
+
+# read channel values and save in list
+list <- lapply(files, function(csv) {
+  # read csv
+  tab <- read.table(paste0(input.dir, csv), header = T, sep = ",")
+  # extract meta data 
+  tab$sample <- csv
+  tab <- tab %>% 
+    mutate(OVA = if_else(str_detect(sample, pattern = "\\+"), true = TRUE, false = FALSE))
+  return(tab)
+})
+
+# combine into one data frame
+data <- bind_rows(list)
+
+# format 
+data <- data %>% 
+  rename(acquisition_time = Time)
+
+# only 131414 cells, no need to sketch ----  
+
+# ratio and scale 
+data$ratio <- data$FSC.A/data$FSC.H
+data$ratio <- scales::rescale(as.numeric(data$ratio), to = c(0, 1023))
+
+calculateThreshold(hist(data$ratio, breaks = 2000, plot = T))
+
+# create Seurat object including ratio as feature
+ova <- CreateSeuratObject(as(object=t(data[,c(1:20, 24)]), Class="dgCMatrix"), assay = "FACS")
+
+# add meta data
+ova@meta.data <- cbind(ova@meta.data, data)
+
+# calculate Otsu threshold and divide cells accordingly 
+cutoff <- calculateThreshold(hist(ova$ratio, breaks = 2000, plot = FALSE))
+ova$ratio_anno <- ifelse(ova$ratio>=cutoff, "Ratio_high", "Ratio_low")
+ova$ratio_anno <- factor(ova$ratio_anno, levels = c("Ratio_low", "Ratio_high"))
+
+# standard Seurat workflow
+ova@assays$FACS$data <- ova@assays$FACS$counts 
+n_dims <- Features(ova) %>% length()
+resolution <- c(0.3,0.5,1,2)
+ova <- ova %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA(npcs=n_dims-1, approx=F) %>%
+  FindNeighbors(dims = 1:n_dims-1) %>%
+  FindClusters(resolution = resolution) %>% 
+  RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = ova, file = paste0(data.dir, "obj.rds"))
+```
+
+# identify doublet clusters
+```{r}
+# directories
+ifelse(!dir.exists(paste0(plot.dir, "02_qc/")), dir.create(paste0(plot.dir, "02_qc/")), FALSE)
+ifelse(!dir.exists(paste0(plot.dir, "01_doublets/")), dir.create(paste0(plot.dir, "01_doublets/")), FALSE)
+
+# clustering resolutions
+resolution <- c("FACS_snn_res.0.3", "FACS_snn_res.0.5", "FACS_snn_res.1", "FACS_snn_res.2")
+
+# clustree plot 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_clustree_all_events.pdf"), height = 7, width = 14)
+clustree(ova, prefix = "FACS_snn_res.", exprs = 'data', assay = 'FACS')
+dev.off() 
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clusters.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+print(DimPlot(ova, reduction = 'umap', group.by = res, label = T) + 
+  labs(title = paste0(res)))
+}
+dev.off()
+
+# ratio cluster plots 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  ova <- select_dbt(ova, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(ova, clusters = res))
+}
+dev.off()
+
+##########################
+##        choose        ##
+##   FACS_snn_res.0.5   ##
+##                      ##
+##########################
+
+# select dbts 
+ova <- select_dbt(ova, clusters = "FACS_snn_res.0.5", selected_clusters = "doublet_clusters", quantile = 0.75)
+
+# add to meta.data
+ova@meta.data <- ova@meta.data %>%
+  mutate(cluster_anno = if_else(condition = as.character(FACS_snn_res.0.5) %in% ova@misc$doublet_clusters_q0.75,
+                                        true = "doublet_cluster", false = "singlet_cluster"))
+
+# save obj
+SeuratObject::SaveSeuratRds(object = ova, file = paste0(data.dir, "obj.rds"))
+```
+
+# quality control
+```{r}
+# number of cells 
+total <- 131414 
+  
+# cells from each condition ----
+ova@meta.data %>% 
+  group_by(OVA) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+# plots ----
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(ova, group.by = "OVA")
+DimPlot(ova, group.by = "OVA", split.by = "OVA")
+dev.off()
+
+# check area/height ratio distribution and cutoff
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_ratio_histogram.pdf"), height = 6, width = 8, onefile = T)
+hist(ova@meta.data$ratio, breaks = 2000)
+cutoff <- calculateThreshold(hist(ova@meta.data$ratio, breaks = 2000, plot = F))
+abline(v=cutoff) 
+dev.off() 
+
+# check FSC.H vs FSC.A in dotplot 
+ggplot(ova@meta.data, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point() 
+
+# plot some QC figures together
+cutoff <- calculateThreshold(hist(ova@meta.data$ratio, breaks = 2000, plot = F))
+p1 <- DimPlot(ova, group.by = "FACS_snn_res.0.5", label = T)
+p2 <- FeaturePlot(ova, "ratio", max.cutoff = cutoff)
+p3 <- ggplot(ova@meta.data, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point()
+p4 <- DimPlot(ova, group.by = "cluster_anno")
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_QC_plots.pdf"), height = 9, width = 15)
+ggarrange(p1, p2, p3, p4)
+hist(ova@meta.data$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off() # all good
+```
+
+# singlet annotation
+```{r}
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "03_annotation/")), dir.create(paste0(plot.dir, "03_annotation/")), FALSE)
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_feature_plots.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(ova, features = colnames(ova@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(ova, features = colnames(ova@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(ova, features = colnames(ova@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(ova, features = colnames(ova@meta.data)[c(22:23,27)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots
+features <- Features(ova)
+for (res in resolution) {
+  Idents(ova) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots_", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(ova, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots_sublclustered", res, ".pdf"), height = 8, width = 5, onefile = T)
+Idents(ova) <- "sub.cluster"
+for (f in features) {
+print(RidgePlot(ova, features = f, slot = "data"))
+}
+dev.off()
+
+# annotation
+ova@meta.data <- mutate(ova@meta.data, celltype = case_when(
+ FACS_snn_res.0.5 == "0"~"activated OVA spec CD4+ T cells",
+ FACS_snn_res.0.5 == "1"~"B cells",
+ FACS_snn_res.0.5 == "2"~"CD8+ T cells",
+ FACS_snn_res.0.5 == "3"~"B cells",
+ FACS_snn_res.0.5 == "4"~"CD8+ T cells",
+ FACS_snn_res.0.5 == "5"~"CD4+ T cells",
+ FACS_snn_res.0.5 == "6"~"OVA spec CD4+ T cells",
+ FACS_snn_res.0.5 == "7"~"PICs",
+ FACS_snn_res.0.5 == "8"~"PICs",
+ sub.cluster == "9_0"~"remove", # low quality
+ sub.cluster == "9_1"~"remove", # not annotable, low quality
+ sub.cluster == "9_2"~"B cells", 
+ FACS_snn_res.0.5 == "10"~"remove", # negative
+ FACS_snn_res.0.5 == "11"~"CD4+ T cells",
+ FACS_snn_res.0.5 == "12"~"TCRvb5+ CD8+ T cells",
+ FACS_snn_res.0.5 == "13"~"TCRvb5+ CD8+ T cells",
+ FACS_snn_res.0.5 == "14"~"PICs",
+ FACS_snn_res.0.5 == "15"~"PICs",
+ FACS_snn_res.0.5 == "16"~"DCs?",
+ FACS_snn_res.0.5 == "17"~"CD8+ T cells",
+ FACS_snn_res.0.5 == "18"~"monocytes",
+ FACS_snn_res.0.5 == "19"~"TCRvb5+ CD4+ T cells",
+ FACS_snn_res.0.5 == "20"~"activated OVA spec CD4+ T cells"
+))
+
+# subset on good clusters 
+ova_clean <- subset(ova, subset = celltype != "remove")
+
+# remove old meta.data and misc slot to avoid confusion
+ova_clean@meta.data <- ova_clean@meta.data %>% dplyr::select(-c(FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1, FACS_snn_res.2, sub.cluster))
+ova_clean@misc <- list() 
+
+# repeat workflow 
+n_dims <- Features(ova_clean) %>% length() # 20 Features
+resolution <- c(0.3,0.5)
+ova_clean <- ova_clean %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA(npcs=n_dims-1, approx=F) %>%
+  FindNeighbors(dims = 1:n_dims-1) %>%
+  FindClusters(resolution = resolution) %>% 
+  RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save new obj 
+SeuratObject::SaveSeuratRds(object = ova_clean, file = paste0(data.dir, "obj_clean.rds"))
+```
+
+##################################
+# Re-analyse high-quality object #
+##################################
+
+# re-identify doublet clusters
+```{r}
+# clustering
+resolution <- c("FACS_snn_res.0.3", "FACS_snn_res.0.5")
+
+# clustree plot 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_clustree_all_events_clean.pdf"), height = 7, width = 14)
+clustree(ova_clean, prefix = "FACS_snn_res.", exprs = 'data', assay = 'FACS')
+dev.off() 
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clusters_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+print(DimPlot(ova_clean, reduction = 'umap', group.by = res, label = T) + 
+  labs(title = paste0(res)))
+}
+dev.off()
+
+# ratio cluster plots 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_clean.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  ova_clean <- select_dbt(ova_clean, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(ova_clean, clusters = res))
+}
+dev.off()
+
+# export source data 
+p <- ratio_cluster_plot(ova_clean, clusters = "FACS_snn_res.0.3")
+write_xlsx(p$data, paste0(plot.dir, "Extended_Data_Figure_3D_sourcedata.xlsx"))
+
+##########################
+##        choose        ##
+##   FACS_snn_res.0.3   ##
+##                      ##
+##########################
+
+# plot composition
+ratio_cluster_plot(ova_clean, clusters = "FACS_snn_res.0.3") # 6,8
+
+# select dbts
+ova_clean <- select_dbt(ova_clean, clusters = "FACS_snn_res.0.3", selected_clusters = "doublet_clusters", quantile = 0.85)
+
+# add to meta.data
+ova_clean@meta.data <- ova_clean@meta.data %>%
+  mutate(cluster_anno = if_else(condition = as.character(FACS_snn_res.0.3) %in% ova_clean@misc$doublet_clusters_q0.85,
+                                true = "doublet_cluster", false = "singlet_cluster"))
+
+# plot overall UMAP ----
+ova_clean$umap_1 <- ova_clean@reductions$umap@cell.embeddings[,1]
+ova_clean$umap_2 <- ova_clean@reductions$umap@cell.embeddings[,2]
+
+# number of colors
+num <- length(unique(ova_clean@meta.data$FACS_snn_res.0.3))
+# plot 
+pdf(paste0(plot.dir, Sys.Date(), "_ova_singletsUMAP_clustering_VF.pdf"), height = 8, width = 10)
+ova_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=FACS_snn_res.0.3)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(FACS_snn_res.0.3)),size=0.05, raster.dpi=700)+
+        scale_color_manual(values = smooth_rainbow(num, range = c(0.1, 0.99))) + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+# save obj
+SeuratObject::SaveSeuratRds(object = ova_clean, file = paste0(data.dir, "obj_clean.rds"))
+```
+
+# repeat quality control 
+```{r}
+# per condition
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(ova_clean, group.by = "OVA")
+DimPlot(ova_clean, group.by = "OVA", split.by = "OVA")
+dev.off()
+
+# check area/height ratio distribution and cutoff
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_ratio_histogram_clean.pdf"), height = 6, width = 8, onefile = T)
+hist(ova_clean@meta.data$ratio, breaks = 2000)
+cutoff <- calculateThreshold(hist(ova_clean@meta.data$ratio, breaks = 2000, plot = F))
+abline(v=cutoff) 
+dev.off() 
+
+# check FSC.H vs FSC.A in dotplot 
+ggplot(ova_clean@meta.data, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point() 
+
+# plot some QC figures together
+cutoff <- calculateThreshold(hist(ova_clean@meta.data$ratio, breaks = 2000, plot = F))
+p1 <- DimPlot(ova_clean, group.by = "FACS_snn_res.0.5", label = T)
+p2 <- FeaturePlot(ova_clean, "ratio", max.cutoff = cutoff)
+p3 <- ggplot(ova_clean@meta.data, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point()
+p4 <- DimPlot(ova_clean, group.by = "cluster_anno")
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_QC_plots_clean.pdf"), height = 9, width = 15)
+ggarrange(p1, p2, p3, p4)
+hist(ova_clean@meta.data$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off()
+
+# supplement QC figures 
+ova_clean@meta.data <- ova_clean@meta.data %>% mutate(unscaled_ratio = FSC.A / FSC.H) # ratio not scaled to 0-1023
+pdf(paste0(plot.dir, Sys.Date(), "_ova_FSCratio_histogram_VF.pdf"), height = 7, width = 4.5)
+gghistogram(ova_clean@meta.data, x = "unscaled_ratio", fill = "ratio_anno", bins = 2000, linetype = "blank") + scale_fill_manual(values = rev(c("orange2", "dodgerblue2"))) 
+dev.off()
+
+pdf(paste0(plot.dir, Sys.Date(), "_ova_FSCratio_dimplot_VF.pdf"), height = 8, width = 10)
+ova_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=ratio_anno)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700) +
+        ggrastr::geom_point_rast(aes(color=as.factor(ratio_anno)),size=0.05, raster.dpi=700) +
+        scale_color_manual(values = rev(c("orange2", "dodgerblue2")))  + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+```
+
+# high quality singlet annotation 
+```{r}
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_feature_plots_clean.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(ova_clean, features = colnames(ova_clean@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(ova_clean, features = colnames(ova_clean@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(ova_clean, features = colnames(ova_clean@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(ova_clean, features = colnames(ova_clean@meta.data)[c(22:23,27)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots
+features <- Features(ova_clean)
+for (res in resolution) {
+  Idents(ova_clean) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots_", res, "_clean.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(ova_clean, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# MEM heatmap ----
+MEM_heatmap(obj = ova_clean, markers = colnames(ova_clean@meta.data)[c(4:6,9:23,27,32)], cluster_col = "FACS_snn_res.0.3", scale_height = 5, scale_width = 4) 
+
+# annotation
+ova_clean@meta.data <- mutate(ova_clean@meta.data, celltype = case_when(
+ FACS_snn_res.0.3 == "0"~"B cells",
+ FACS_snn_res.0.3 == "1"~"activated OVA spec CD4+ T cells",
+ FACS_snn_res.0.3 == "2"~"CD8+ T cells",
+ FACS_snn_res.0.3 == "3"~"B cells",
+ FACS_snn_res.0.3 == "4"~"CD8+ T cells",
+ FACS_snn_res.0.3 == "5"~"CD4+ T cells",
+ FACS_snn_res.0.3 == "6"~"PICs",
+ FACS_snn_res.0.3 == "7"~"OVA spec CD4+ T cells",
+ FACS_snn_res.0.3 == "8"~"PICs",
+ FACS_snn_res.0.3 == "9"~"CD8+ T cells",
+ FACS_snn_res.0.3 == "10"~"CD4+ T cells",
+ FACS_snn_res.0.3 == "11"~"myeloid cells",
+ FACS_snn_res.0.3 == "12"~"DCs",
+ FACS_snn_res.0.3 == "13"~"CD8+ T cells"
+))
+
+# plot
+DimPlot(ova_clean, group.by = "celltype", label = T)
+
+# annotated heatmap for supplements
+# calculate MEM scores ----
+MEM <- ova_clean@meta.data %>% 
+  dplyr::select(c(FSC.A:SSC.A, SSC.H:CD4, ratio, celltype)) %>% 
+  mutate(cluster = as.numeric(factor(celltype, levels = unique(celltype)))) # turn celltypes into ID numbers since MEM can't deal with strings 
+
+# key
+celltype_anno <- unique(ova_clean$celltype)
+
+# calculation of MEM scores
+MEM_values <-MEM(MEM[,c(1:18,21)],
+                 transform = F,
+                 choose.markers = F,
+                 markers = "all",
+                 choose.ref = F,
+                 zero.ref = F,
+                 IQR.thresh = NULL)
+
+# heatmap with celltype anno labels
+heatmap <- as.data.frame(MEM_values$MEM_matrix[[1]])
+
+cols <- colorRamp2(seq(from = -10, to = 10, length.out = 100), pals::coolwarm(100))
+h1 <- Heatmap(t(as.matrix(heatmap)),
+        # col=cols,
+        # col=pals::coolwarm(100),
+        hcl.colors(100, "Blue-Red 3"),
+        name = "MEM enrichment score",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "ward.D2",
+        column_title = "clusters", 
+        row_title = "markers",
+        column_labels = celltype_anno,
+        row_names_gp = gpar(fontsize = 9),
+        column_names_gp = gpar(fontsize = 9),
+        show_row_names = T,
+        cluster_rows = T,
+        cluster_columns = T,
+        show_parent_dend_line = FALSE,
+        width = ncol(heatmap)*unit(2.2, "mm"), 
+        height = nrow(heatmap)*unit(10, "mm"))
+
+# plot heatmap ----
+pdf(paste0(plot.dir, Sys.Date(), "_ova_singlets_MEMheatmap_VF.pdf"), height = 7, width = 7)
+print(h1)
+dev.off()
+
+# export source data
+colnames(h1@matrix) <- h1@column_names_param$labels
+write_xlsx(as.data.frame(h1@matrix) %>% rownames_to_column(var = "marker"), paste0(plot.dir, "Extended_Data_Figure_3F_sourcedata.xlsx"))
+
+# save new obj 
+SeuratObject::SaveSeuratRds(object = ova_clean, file = paste0(data.dir, "obj_clean_annoated.rds"))
+```
+
+# doublet annotation
+```{r}
+# subset doublet clusters 
+DefaultAssay(ova_clean) <- 'FACS'
+dbts_ova <- subset(ova_clean, subset = cluster_anno == "doublet_cluster") 
+
+# new assay 
+dbts_ova[["dbts"]] <- CreateAssay5Object(counts = dbts_ova@assays$FACS$counts, data = dbts_ova@assays$FACS$data)
+DefaultAssay(dbts_ova) <- "dbts"
+
+# repeat seurat workflow
+resolution <- c(0.3, 0.5, 1)
+
+dbts_ova <- dbts_ova %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=21, approx=F) %>%
+    FindNeighbors(dims = 1:20) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:20, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_ova, file = paste0(data.dir, "obj_doublets.rds"))
+
+# plots 
+ifelse(!dir.exists(paste0(plot.dir, "04_doublet_annotation/")), dir.create(paste0(plot.dir, "04_doublet_annotation/")), FALSE)
+
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_dimplot_clusters_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_ova, reduction = 'umap', group.by = paste0("dbts_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_feature_plots_doublets.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(dbts_ova, features = colnames(dbts_ova@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_ova, features = colnames(dbts_ova@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_ova, features = colnames(dbts_ova@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_ova, features = colnames(dbts_ova@meta.data)[c(22:23,27)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots 
+features <- Features(dbts_ova)
+for (res in resolution) {
+  Idents(dbts_ova) <- paste0("dbts_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_res", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_ova, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# clustree
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_clustree_doublets.pdf"), height = 7, width = 14)
+clustree(dbts_ova, prefix = "dbts_snn_res.", exprs = 'data', assay = 'dbts')
+dev.off() 
+
+# MEM heatmap ----
+MEM_heatmap(obj = dbts_ova, markers = colnames(dbts_ova@meta.data)[c(4:6, 9:23, 27, 38)], cluster_col = "dbts_snn_res.1")
+
+# subcluster 14
+Idents(dbts_ova) <- "dbts_snn_res.1"
+dbts_ova <- FindSubCluster(dbts_ova, cluster = "14", graph.name = "dbts_snn", subcluster.name = "sub.cluster", resolution = 0.1)
+
+# annotation
+dbts_ova@meta.data <- mutate(dbts_ova@meta.data, doublet_type = case_when(
+  dbts_snn_res.1 == "0"~"APC*APC", 
+  dbts_snn_res.1 == "1"~"APC*APC", 
+  dbts_snn_res.1 == "2"~"APC*APC", 
+  dbts_snn_res.1 == "3"~"OVAspecCD4*APC", 
+  dbts_snn_res.1 == "4"~"OVAspecCD4*APC", 
+  dbts_snn_res.1 == "5"~"OVAspecCD4*APC", 
+  dbts_snn_res.1 == "6"~"CD8+T*APC", 
+  dbts_snn_res.1 == "7"~"APC*APC", 
+  dbts_snn_res.1 == "8"~"CD4+T*APC", 
+  dbts_snn_res.1 == "9"~"CD4+T*APC", 
+  dbts_snn_res.1 == "10"~"CD8+T*APC", 
+  dbts_snn_res.1 == "11"~"APC*APC", 
+  dbts_snn_res.1 == "12"~"APC*APC", 
+  dbts_snn_res.1 == "13"~"CD8*CD8",
+  sub.cluster == "14_0"~"OVAspecCD4*OVAspecCD4",
+  sub.cluster == "14_1"~"OVAspecCD4*CD8",
+  dbts_snn_res.1 == "15"~"OVAspecCD4*CD8*APC", 
+  dbts_snn_res.1 == "16"~"remove", # high scatter, low quality
+  dbts_snn_res.1 == "17"~"CD8*CD8", 
+  dbts_snn_res.1 == "18"~"CD4*CD8"
+))
+
+# plot
+DimPlot(dbts_ova, group.by = "doublet_type", split.by = "OVA", label = T)
+
+# save annotated obj 
+SeuratObject::SaveSeuratRds(object = dbts_ova, file = paste0(data.dir, "obj_doublets_annotated.rds"))
+
+# keep high-quality, heterotypic clusters 
+keep <- c("CD4+T*APC", "CD8+T*APC", "OVAspecCD4*APC", "CD4*CD8", "OVAspecCD4*CD8*APC", "OVAspecCD4*CD8")
+dbts_ova_clean <- subset(dbts_ova, subset = doublet_type %in% keep)
+
+# remove old clustering and labels to avoid confusion
+dbts_ova_clean@meta.data <- dbts_ova_clean@meta.data %>% dplyr::select(-c(dbts_snn_res.0.3, dbts_snn_res.0.5, dbts_snn_res.1, doublet_type))
+
+# repeat Seurat workflow 
+resolution <- c(0.3, 0.5, 1)
+n_dims <- Features(dbts_ova_clean) %>% length() 
+dbts_ova_clean <- dbts_ova_clean %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=n_dims-1, approx=F) %>%
+    FindNeighbors(dims = 1:n_dims-1) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_ova_clean, file = paste0(data.dir, "obj_doublets_clean.rds"))
+```
+
+# high quality heterotypic doublet annotation 
+```{r}
+# plots 
+DimPlot(dbts_ova_clean, group.by = "dbts_snn_res.0.3")
+
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_dimplot_clusters_doublets_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_ova_clean, reduction = 'umap', group.by = paste0("dbts_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_feature_plots_doublets_clean.pdf"), height = 9, width = 10, onefile = T)
+FeaturePlot(dbts_ova_clean, features = colnames(dbts_ova_clean@meta.data)[4:9]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_ova_clean, features = colnames(dbts_ova_clean@meta.data)[10:15]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_ova_clean, features = colnames(dbts_ova_clean@meta.data)[c(16:21)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_ova_clean, features = colnames(dbts_ova_clean@meta.data)[c(22:23,27)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots 
+features <- Features(dbts_ova_clean)
+for (res in resolution) {
+  Idents(dbts_ova_clean) <- paste0("dbts_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_res", res, "_clean.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_ova_clean, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# clustree
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_clustree_doublets_clean.pdf"), height = 7, width = 14)
+clustree(dbts_ova_clean, prefix = "dbts_snn_res.", exprs = 'data', assay = 'dbts')
+dev.off() 
+
+# MEM heatmap ----
+MEM_heatmap(obj = dbts_ova_clean, markers = colnames(dbts_ova_clean@meta.data)[c(4:6, 9:23, 27, 38)], cluster_col = "dbts_snn_res.0.5")
+
+# annotation
+dbts_ova_clean@meta.data <- mutate(dbts_ova_clean@meta.data, doublet_type = case_when(
+  dbts_snn_res.0.5 == "0"~"OVA_CD4+T*APC", 
+  dbts_snn_res.0.5 == "1"~"OVA_CD4+T*APC", 
+  dbts_snn_res.0.5 == "2"~"CD8+T*APC", 
+  dbts_snn_res.0.5 == "3"~"OVA_CD4+T*APC", 
+  dbts_snn_res.0.5 == "4"~"CD4+T*APC", 
+  dbts_snn_res.0.5 == "5"~"CD4+T*APC", 
+  dbts_snn_res.0.5 == "6"~"CD8+T*APC", 
+  dbts_snn_res.0.5 == "7"~"CD4+T*CD8+T",
+  dbts_snn_res.0.5 == "8"~"OVA_CD4+T*CD8+T"
+))
+
+# plot
+DimPlot(dbts_ova_clean, group.by = "doublet_type", split.by = "OVA", label = T)
+
+# annotated heatmap for supplements
+# calculate MEM scores ----
+MEM <- dbts_ova_clean@meta.data %>% 
+  dplyr::select(c(FSC.A:SSC.A, SSC.H:CD4, ratio, doublet_type)) %>% 
+  mutate(cluster = as.numeric(factor(doublet_type, levels = unique(doublet_type)))) # turn doublet_types into ID numbers since MEM can't deal with strings 
+
+# key
+doublet_type_anno <- unique(dbts_ova_clean$doublet_type)
+
+# calculation of MEM scores
+MEM_values <-MEM(MEM[,c(1:18,21)],
+                 transform = F,
+                 choose.markers = F,
+                 markers = "all",
+                 choose.ref = F,
+                 zero.ref = F,
+                 IQR.thresh = NULL)
+
+# heatmap with doublet type anno labels
+heatmap <- as.data.frame(MEM_values$MEM_matrix[[1]])
+cols <- colorRamp2(seq(from = -10, to = 10, length.out = 100), pals::coolwarm(100))
+h2 <- Heatmap(t(as.matrix(heatmap)),
+        hcl.colors(100, "Blue-Red 3"),
+        name = "MEM enrichment score",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "ward.D2",
+        column_title = "clusters", 
+        row_title = "markers",
+        column_labels = doublet_type_anno,
+        row_names_gp = gpar(fontsize = 9),
+        column_names_gp = gpar(fontsize = 9),
+        show_row_names = T,
+        cluster_rows = T,
+        cluster_columns = T,
+        show_parent_dend_line = FALSE,
+        width = ncol(heatmap)*unit(1, "mm"), 
+        height = nrow(heatmap)*unit(15, "mm"))
+
+# plot heatmap ----
+pdf(paste0(plot.dir, Sys.Date(), "_ova_doublets_MEMheatmap_VF.pdf"), height = 7, width = 7)
+print(h2)
+dev.off()
+
+# export source data
+colnames(h2@matrix) <- h2@column_names_param$labels
+write_xlsx(as.data.frame(h2@matrix) %>% rownames_to_column(var = "marker"), paste0(plot.dir, "Extended_Data_Figure_3I_sourcedata.xlsx"))
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_ova_clean, file = paste0(data.dir, "obj_doublets_clean_annoated.rds"))
+```
+
+# plotting 
+```{r}
+# singlets 
+colors <- c("DCs" = "#99708d", 
+            "B cells" = "#4B65BE",
+            "CD8+ T cells" = "#7AA1A7",
+            "CD4+ T cells" = "#609162",
+            "myeloid cells" = "#9C1D54", 
+            "PICs" = "#ED8706", 
+            "OVA spec CD4+ T cells" = "#3A5743",
+            "activated OVA spec CD4+ T cells" = "#5AA22B")
+
+DimPlot(ova_clean, group.by = "celltype", label = T, cols = colors)
+
+# UMAP Domi style 
+ova_clean$umap_1 <- ova_clean@reductions$umap@cell.embeddings[,1]
+ova_clean$umap_2 <- ova_clean@reductions$umap@cell.embeddings[,2]
+
+pdf(paste0(plot.dir, Sys.Date(), "_OVA_singletsUMAP_VF.pdf"), height = 7, width = 10)
+ova_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=celltype)) +
+        ggrastr::geom_point_rast(size = 0.2, color = "black", raster.dpi = 700) +
+        ggrastr::geom_point_rast(aes(color = as.factor(celltype)), size = 0.05, raster.dpi = 700) +
+        scale_color_manual(values = colors) + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size = 5)))
+dev.off()
+
+# supplement figure features
+Feature_Plot <- FeaturePlot(ova_clean, features=colnames(ova_clean@meta.data)[c(4:6, 9:23, 27)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 1.5)
+for(i in 1:length(Feature_Plot)) suppressMessages({
+  Feature_Plot[[i]] <- Feature_Plot[[i]] + 
+    scale_colour_gradientn(colours = pals::parula(n = 100)) +
+    theme_classic() +
+    NoLegend() + 
+    NoAxes()
+})
+pdf(paste0(plot.dir, Sys.Date(), "_ova_singletsUMAP_features_VF.pdf"), height = 8, width = 7)
+print(cowplot::plot_grid(plotlist = Feature_Plot, nrow = 4))
+dev.off()
+
+# plot point density to more accurately show changes in PIC numbers across OVA+/-
+ggplot(ova_clean@meta.data, aes(x = umap_1, y = umap_2)) + 
+  rasterise(geom_pointdensity(size = 0.2, raster.dpi = 700, method = "auto")) + 
+  facet_wrap(~OVA, ncol = 3) + scale_color_viridis() + theme_classic()
+
+# density for the supplements
+pdf(paste0(plot.dir, Sys.Date(), "_ova_density_all_timepoints_singlets_VF.pdf"), height = 5, width = 10)
+ggplot(ova_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.2, method = "auto") + 
+  facet_wrap(~OVA, ncol = 6) + scale_color_viridis() + theme_classic()
+dev.off()
+
+# doublets ----
+colors <- c("CD4+T*APC" = "#007042",  
+            "CD8+T*APC" = "#74CCE5", 
+            "OVA_CD4+T*APC" = "#9FBC2E",  
+            "CD4+T*CD8+T" = "#69539C",
+            "OVA_CD4+T*CD8+T" = "#009649")
+
+dbts_ova_clean$umap_1 <- dbts_ova_clean@reductions$umap@cell.embeddings[,1]
+dbts_ova_clean$umap_2 <- dbts_ova_clean@reductions$umap@cell.embeddings[,2]
+
+pdf(paste0(plot.dir, Sys.Date(), "_OVA_doubletsUMAP_VF.pdf"), height = 6, width = 8)
+dbts_ova_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color = doublet_type)) +
+        ggrastr::geom_point_rast(size = 2, color = "black", raster.dpi = 700)+
+        ggrastr::geom_point_rast(aes(color = as.factor(doublet_type)), size = 1.5, raster.dpi = 700) +
+        scale_color_manual(values = colors) + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+# supplement figure features
+Feature_Plot <- FeaturePlot(dbts_ova_clean, features=colnames(dbts_ova_clean@meta.data)[c(4:6, 9:23, 27)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 2.5)
+for(i in 1:length(Feature_Plot)) suppressMessages({
+  Feature_Plot[[i]] <- Feature_Plot[[i]] + 
+    scale_colour_gradientn(colours = pals::parula(n = 100)) +
+    theme_classic() +
+    NoLegend() + 
+    NoAxes()
+})
+pdf(paste0(plot.dir, Sys.Date(), "_ova_doubletsUMAP_features_VF.pdf"), height = 8, width = 7)
+print(cowplot::plot_grid(plotlist = Feature_Plot, nrow = 4))
+dev.off()
+
+# density for the supps
+pdf(paste0(plot.dir, Sys.Date(), "_ova_density_all_timepoints_doublets_VF.pdf"), height = 5, width = 10)
+ggplot(dbts_ova_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.5, method = "auto") + 
+  facet_wrap(~OVA, ncol = 6) + scale_color_viridis() + theme_classic()
+dev.off()
+```
+
+# quantification
+```{r}
+# singlet cell types 
+cell_num <- as.data.frame(table(ova_clean$celltype, ova_clean$sample)) %>% 
+  pivot_wider(names_from = Var2, values_from = Freq) %>% 
+  column_to_rownames("Var1") 
+
+# total cell numbers per sample, only removing low quality clusters 
+sample_total <- as.data.frame(table(ova$sub.cluster.9, ova$sample)) %>% 
+  pivot_wider(names_from = Var2, values_from = Freq) %>% 
+  dplyr::filter(!Var1 %in% c("9_0","9_1")) %>% 
+  summarise(across(2:7, sum))
+
+# extract cluster sizes per condition, sample 
+fc_ova <- dbts_ova_clean@meta.data %>% 
+  group_by(doublet_type, OVA, sample) %>% 
+  count() %>% 
+  mutate(doublet_type = factor(doublet_type, levels = c("CD4+T*APC", "CD8+T*APC", "OVA_CD4+T*APC", "CD4+T*CD8+T", "OVA_CD4+T*CD8+T"))) 
+
+# total cell numbers per sample (only removing low quality cells)
+fc_ova$total <- 0
+for (n in 1:nrow(fc_ova)) {
+  fc_ova$total[n] <- sample_total[[fc_ova$sample[n]]]
+}
+
+# frequency
+fc_ova <- fc_ova %>% 
+  mutate(freq = n / total)
+
+# add corresponding control frequencies 
+controls <- fc_ova %>% 
+  dplyr::filter(OVA == F) %>% 
+  dplyr::group_by(doublet_type) %>% 
+  summarize(mean = mean(freq)) %>% 
+  column_to_rownames("doublet_type")
+
+fc_ova <- fc_ova %>% 
+  mutate(control_mean = controls[doublet_type,]) %>% 
+  mutate(FC = freq / control_mean) %>% 
+  mutate(log2FC = log2(FC))
+
+# test for normality
+fc_ova %>% dplyr::filter(doublet_type %in% c("CD4+T*APC", "CD8+T*APC", "OVA_CD4+T*APC", "CD4+T*CD8+T")) %>% group_by(doublet_type) %>% shapiro_test(log2FC) # no
+
+# stats
+stat.test <- as.data.frame(fc_ova) %>%
+  dplyr::filter(doublet_type %in% c("CD4+T*APC", "CD8+T*APC", "OVA_CD4+T*APC", "CD4+T*CD8+T")) %>%
+  group_by(doublet_type) %>%
+  rstatix::emmeans_test(log2FC ~ OVA) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  add_xy_position(x = "doublet_type", group = "doublet_type")
+
+
+colors <- c("CD4+T*APC" = "#007042",  
+            "CD8+T*APC" = "#74CCE5", 
+            "OVA_CD4+T*APC" = "#9FBC2E",  
+            "CD4+T*CD8+T" = "#69539C",
+            "OVA_CD4+T*CD8+T" = "#009649")
+
+# plot
+pdf(paste0(plot.dir, Sys.Date(), "_OVA_stripchart_mean_sd_VF.pdf"), height = 6, width = 4)
+p <- ggstripchart(fc_ova %>% dplyr::filter(OVA == T, doublet_type %in% c("CD4+T*APC", "CD8+T*APC", "OVA_CD4+T*APC", "CD4+T*CD8+T")), 
+             x = "doublet_type", y = "log2FC",  add = "mean_sd", error.plot = "errorbar", fill = "doublet_type", jitter = 0.2, 
+             size = 6, add.params = list(color = "black"), shape = 21) + 
+  theme_classic() +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values = colors) + scale_color_manual(values = colors) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_y_continuous(breaks=c(-2:6), limits = c(NA,6)) + 
+  stat_summary(fun = mean, fun.min = mean, fun.max = mean, 
+               geom = "errorbar", color = "black", width = 0.3, size = 0.5)
+print(p)
+dev.off()
+
+# export source data 
+write_xlsx(p$data, paste0(plot.dir, "Figure2J_sourcedata.xlsx"))
+```
+
+# export obj as data.frames for publication 
+```{r}
+# OVERALL CELLULAR LANDSCAPE --------------------------------------------------------
+# all events  
+all <- ova@meta.data %>% 
+  # filter out low quality clusters that do not contribute to frequency calculations 
+  dplyr::filter(!sub.cluster %in% c("9_0","9_1")) %>% 
+  # remove columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, acquisition_time, 
+                   FACS_snn_res.0.3, FACS_snn_res.0.5, FACS_snn_res.1,
+                   FACS_snn_res.2, seurat_clusters, sub.cluster, cluster_anno, 
+                   celltype))
+
+# final overall landscape data 
+# add umap values 
+ova_clean$umap_1 <- ova_clean@reductions$umap@cell.embeddings[,1]
+ova_clean$umap_2 <- ova_clean@reductions$umap@cell.embeddings[,2]
+
+overall <- ova_clean@meta.data %>% 
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, acquisition_time,
+                   seurat_clusters, FACS_snn_res.0.5))
+
+# make sure all values except clustering, cluster_anno, celltype and umap_1/2 are the same 
+identical(all[rownames(overall),], overall[,1:24]) # yes 
+
+# merge both data.frames
+overall_landscape <- left_join(all, overall)
+
+# save as csv
+write_csv(overall_landscape, file = paste0(data.dir, Sys.Date(), "_ova_overall_landscape.csv"), 
+          col_names = T, quote = "all")
+
+
+# INTERACTING LANDSCAPE --------------------------------------------------------
+dbts <- dbts_ova@meta.data %>% 
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, acquisition_time, 
+                   seurat_clusters, celltype, FACS_snn_res.0.3, FACS_snn_res.0.5,
+                   nCount_dbts, nFeature_dbts, dbts_snn_res.0.3, dbts_snn_res.0.5,
+                   dbts_snn_res.1, sub.cluster, doublet_type))
+ 
+# final overall landscape data 
+# add umap values 
+dbts_ova_clean$umap_1 <- dbts_ova_clean@reductions$umap@cell.embeddings[,1]
+dbts_ova_clean$umap_2 <- dbts_ova_clean@reductions$umap@cell.embeddings[,2]
+
+dbts_final <- dbts_ova_clean@meta.data %>%
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, acquisition_time, 
+                   seurat_clusters, celltype, FACS_snn_res.0.3, FACS_snn_res.0.5,
+                   nCount_dbts, nFeature_dbts, sub.cluster, dbts_snn_res.0.3, 
+                   dbts_snn_res.1)) %>% 
+  rename(interaction = doublet_type)
+
+# make sure all values except clustering, doublet type and umap_1/2 are the same 
+identical(dbts[rownames(dbts_final),], dbts_final[,c(1:25)]) # yes 
+
+# join
+interacting_landscape <- left_join(dbts, dbts_final)
+
+# save as csv
+write_csv(interacting_landscape, file = paste0(data.dir, Sys.Date(), "_ova_interacting_landscape.csv"), 
+          col_names = T, quote = "all")
+```

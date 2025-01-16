@@ -1,0 +1,1233 @@
+---
+title: "Data Analysis in vitro Blinatumomab Time Course"
+output: html_notebook
+author: "Viktoria Flore"
+date: "2024-01-15"
+---
+
+This is the analysis script for the Blinatumomab Time Course experiment in 
+Vonficht, Jopp-Saile, Yousefian, Flore et al. Ultra-high scale cytometry-based 
+cellular interaction mapping, Nature Methods (2025). Pre-processed csv files can 
+be found on Zenodo at https://doi.org/10.5281/zenodo.10637096.
+
+# load packages and set paths 
+```{r results='hide', message=FALSE, warning=FALSE}
+library(Seurat)
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 2e9)
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(readr)
+library(BPCells)
+library(pals)
+library(tidyverse)
+library(dplyr)
+library(rstatix)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsci)
+library(ggrastr)
+library(khroma)
+library(pbapply)
+library(viridis)
+library(MASS)
+library(clustree)
+library(ggrepel)
+library(ggpointdensity)
+library(cytoMEM)
+library(ComplexHeatmap)
+library(circlize)
+library(writexl)
+library(tibble)
+library(PICtR) # version 0.1.0
+
+dir <- "./blinatumomab_time_course/"
+data.dir <- "./blinatumomab_time_course/data/"
+plot.dir <- "./blinatumomab_time_course/plots/"
+input.dir <- "./blinatumomab_time_course/csv_files/"
+
+# set analysis 
+exp <- "time_course"
+```
+
+# in vitro blinatumomab data
+```{r, message=FALSE, warning=FALSE}
+# find channel value csv files 
+files <- dir(paste0(input.dir), pattern="*.csv")
+
+# read channel values and save in list
+list <- lapply(files, function(csv) {
+  # read csv
+  tab <- read.table(paste0(input.dir, csv), header = T, sep = ",")
+  # extract meta data 
+  tab$sample <- csv
+  tab$time <- 0
+  tab <- tab %>% 
+    mutate(time = if_else(str_detect(sample, "2"), true = 0.25, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "3"), true = 1, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "4"), true = 2, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "5"), true = 3, false = time)) %>%
+    mutate(time = if_else(str_detect(sample, "6"), true = 5, false = time)) %>%
+  return(tab)
+})
+
+# combine into one dataframe
+data <- bind_rows(list)
+
+# formatting
+data <- data %>%
+  # rename column names
+  rename(AF = Comp.AF.A, aquisition_time = Time)
+
+
+# sketching including scatter channels and ratio as features, exclude Caspase, LD, and width parameters, and secondary scatters
+blina <- sketch_wrapper(channel=data[,c(1:2,4,8,11:28,30:38)],
+                       meta_data=data,
+                       assay="FACS",
+                       FSC.A="FSC.A",
+                       FSC.H="FSC.H",
+                       n_sketch_cells=50000,
+                       n_dims,
+                       resolution=c(0.5,1,2,3,4),
+                       obj_name="obj_sketched_non_projected",
+                       group_by=NULL,
+                       verbose=TRUE,
+                       BPcell_dir=NULL,
+                       ratio=TRUE,
+                       working_dir=data.dir)
+```
+
+# identify doublet clusters 
+```{r}
+# directories
+ifelse(!dir.exists(paste0(plot.dir, "02_qc/")), dir.create(paste0(plot.dir, "02_qc/")), FALSE)
+ifelse(!dir.exists(paste0(plot.dir, "01_doublets/")), dir.create(paste0(plot.dir, "01_doublets/")), FALSE)
+
+# sketched cells 
+sketched <- blina@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# clustering resolutions
+resolution <- c("sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2", "sketch_snn_res.3", "sketch_snn_res.4")
+
+# clustree plot 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_clustree_all_events.pdf"), height = 7, width = 14)
+clustree(blina %>% subset(cells = rownames(sketched)), prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+# ratio cluster plots and preliminary selection of doublet clusters
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  blina <- select_dbt(blina, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(blina, clusters = res))
+}
+dev.off()
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clusters.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+print(DimPlot(blina, reduction = 'umap', group.by = res, label = T) + 
+  labs(title = paste0(res)))
+}
+dev.off()
+
+##########################
+##        choose        ##
+##   sketch_snn_res.1   ##
+##                      ##
+##########################
+
+# check clustering for each cluster at resolution 1
+Idents(blina) <- "sketch_snn_res.1"
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_highlighted_clusters_res1.pdf"), height = 7, width = 9, onefile = T)
+for (i in 1:length(unique(blina$sketch_snn_res.1))) {
+  print(DimPlot(blina, cells.highlight = WhichCells(blina, idents = as.character(i))))
+}
+dev.off()
+
+blina <- FindSubCluster(blina, cluster = "19", graph.name = "sketch_snn", resolution = 0.2, subcluster.name = "sub.cluster")
+for (i in c("16", "26", "27")) {
+  Idents(blina) <- "sub.cluster"
+  blina <- FindSubCluster(blina, cluster = i, graph.name = "sketch_snn", resolution = 0.1, subcluster.name = "sub.cluster")
+}
+
+# coerce subcluster names for project_data() to work 
+blina@meta.data <- blina@meta.data %>% 
+  mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", "."))
+
+# project chosen clustering to all cells
+blina <- project_data(obj = blina,
+                     data_query = blina, 
+                     ref_clusters = "sub.cluster", 
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_snn_res.1",
+                     chunk_size=1000000, 
+                     assay_ref = "sketch",
+                     assay_query = "FACS")
+
+# ratio cluster plot for all projected cells 
+p1 <- blina@meta.data %>%  group_by(pred_snn_res.1, ratio_anno) %>% count(ratio_anno) %>% 
+    ggplot(aes(x = reorder(pred_snn_res.1, as.numeric(pred_snn_res.1), FUN = max), y = n, fill = ratio_anno)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_fill_manual(values = rev(c("orange2", "dodgerblue2"))) +
+    xlab("Clusters") +
+    labs(y = "Count") +
+    ggtitle("Cluster Analysis") +
+    theme_minimal()
+
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events_projected.pdf"), height = 7, width = 14)
+p1
+dev.off()
+
+# select doublet clusters
+blina <- select_dbt(blina, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.8)
+blina <- select_dbt(blina, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.85) 
+blina <- select_dbt(blina, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.87) # take this one 
+
+# add meta.data 
+dbts <- blina@misc$doublet_clusters_res.1_q0.87
+blina@meta.data <- blina@meta.data %>% 
+  mutate(cluster_anno = if_else(condition = as.character(pred_snn_res.1) %in% dbts, true = "doublet_cluster", false = "singlet_cluster"))
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = blina, file = paste0(data.dir, "obj_sketched_projected.rds"), destdir = paste0(data.dir, "counts"))
+```
+
+# quality control
+```{r}
+# subset meta.data from sketched cells 
+sketched <- blina@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# cell numbers
+total <- 1013946
+
+# cells from each time point ----
+blina@meta.data %>% 
+  group_by(time) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+sketched %>% 
+  group_by(time) %>% 
+  count() %>% 
+  mutate(of_total = n / 50000)
+
+# plots ----
+# per time point 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_time_points.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(blina, group.by = "time")
+dev.off()
+
+# check area/height ratio distribution and cutoff
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_ratio_histogram.pdf"), height = 6, width = 8, onefile = T)
+hist(blina@meta.data$ratio, breaks = 2000)
+cutoff <- calculateThreshold(hist(blina@meta.data$ratio, breaks = 2000, plot = F))
+abline(v=cutoff) 
+dev.off()
+
+# plot some QC plots together
+cutoff <- calculateThreshold(hist(blina@meta.data$ratio, breaks = 2000, plot = F))
+p1 <- DimPlot(blina, group.by = "pred_snn_res.1", label = T)
+p2 <- FeaturePlot(blina, "ratio", max.cutoff = cutoff)
+p3 <- ggplot(sketched, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point()
+p4 <- DimPlot(blina, group.by = "cluster_anno")
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_QC_plots.pdf"), height = 9, width = 15)
+ggarrange(p1, p2, p3, p4)
+hist(blina@meta.data$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off()
+```
+
+# singlet annotation
+```{r}
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "03_annotation/")), dir.create(paste0(plot.dir, "03_annotation/")), FALSE)
+
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_feature_plots.pdf"), height = 7, width = 14, onefile = T)
+FeaturePlot(blina, features = colnames(blina@meta.data)[c(4,5,7,11,13:20)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(blina, features = colnames(blina@meta.data)[21:32]) & scale_color_viridis(option = 'magma')
+FeaturePlot(blina, features = colnames(blina@meta.data)[c(33:42,46)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots
+features <- Features(blina)
+for (res in resolution) {
+  Idents(blina) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(blina, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# subclustered RidgePlot
+Idents(blina) <- "pred_snn_res.1"
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots", "subclustered.pdf"), height = 8, width = 5, onefile = T)
+for (f in features) {
+  print(RidgePlot(blina, features = f, slot = 'data'))
+}
+dev.off()
+
+# MEM heatmap on sketched and subclustered cells 
+sketched <- blina@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+sketched <- subset(blina, cells = rownames(sketched))
+MEM_heatmap(obj = sketched, markers = colnames(sketched@meta.data)[c(4,5,7,11,14:31,33:41,55)], cluster_col = "pred_snn_res.1", scale_height = 5, scale_width = 4)
+
+blina@meta.data <- mutate(blina@meta.data, celltype = case_when(
+  pred_snn_res.1 == "0"~"myeloid cells",
+  pred_snn_res.1 == "1"~"memory CD4+T cells",
+  pred_snn_res.1 == "2"~"memory CD8+T cells",
+  pred_snn_res.1 == "3"~"naive CD4+T cells",
+  pred_snn_res.1 == "4"~"CD16+ NK cells",
+  pred_snn_res.1 == "5"~"cDCs",
+  pred_snn_res.1 == "6"~"NK cells",
+  pred_snn_res.1 == "7"~"B cells",
+  pred_snn_res.1 == "8"~"PICs",
+  pred_snn_res.1 == "9"~"B cells",
+  pred_snn_res.1 == "10"~"NKT cells",
+  pred_snn_res.1 == "11"~"naive gdT cells",
+  pred_snn_res.1 == "12"~"PICs",
+  pred_snn_res.1 == "13"~"naive CD8+T cells",
+  pred_snn_res.1 == "14"~"PICs",
+  pred_snn_res.1 == "15"~"memory CD8+T cells",
+  pred_snn_res.1 == "16"~"gdT cells",
+  pred_snn_res.1 == "16.1"~"gdT cells",
+  pred_snn_res.1 == "16.2"~"gdT cells",
+  pred_snn_res.1 == "17"~"progenitors",
+  pred_snn_res.1 == "18"~"PICs",
+  pred_snn_res.1 == "19"~"remove", # negative
+  pred_snn_res.1 == "19.1"~"progenitors",
+  pred_snn_res.1 == "19.2"~"progenitors",
+  pred_snn_res.1 == "19.3"~"progenitors", 
+  pred_snn_res.1 == "20"~"memory CD4+T cells",
+  pred_snn_res.1 == "21"~"memory CD4+T cells",
+  pred_snn_res.1 == "22"~"CD56+ CD8+T cells",
+  pred_snn_res.1 == "23"~"myeloid cells",
+  pred_snn_res.1 == "24"~"PICs",
+  pred_snn_res.1 == "25"~"remove", # not annotateable
+  pred_snn_res.1 == "26"~"remove", # not annotateable
+  pred_snn_res.1 == "26.1"~"remove", # not annotateable
+  pred_snn_res.1 == "27"~"CD8+T cells", 
+  pred_snn_res.1 == "27.1"~"remove", # not annotateable
+  pred_snn_res.1 == "28"~"remove", # compensation problem 
+  pred_snn_res.1 == "29"~"remove" # not annotateable
+))
+
+# save annotated obj
+SeuratObject::SaveSeuratRds(object = blina, 
+                            file = paste0(data.dir, "obj_sketched_projected_annotated.rds"), destdir = paste0(data.dir, "/counts"))
+
+# remove low quality clusters and recompute
+blina_clean <- subset(blina, subset = celltype != "remove")
+
+# remove prior analyses from the meta.data to avoid confusion
+blina_clean@meta.data <- blina_clean@meta.data %>% 
+  dplyr::select(-c(sketch_snn_res.0.5, sketch_snn_res.1, sketch_snn_res.2, 
+                   sketch_snn_res.3, sketch_snn_res.4, cluster_anno, celltype, 
+                   pred_snn_res.1, sub.cluster))
+
+# clean misc slot
+blina_clean@misc <- list()
+
+# standard seurat workflow 
+DefaultAssay(blina_clean) <- "sketch"
+n_dims <- Features(blina_clean) %>% length()
+resolution <- c(0.5, 1, 2, 3, 4)
+blina_clean <- blina_clean %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=n_dims-1, approx=F) %>%
+    FindNeighbors(dims = 1:n_dims-1) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save cleaned object 
+SeuratObject::SaveSeuratRds(object = blina_clean, file = paste0(data.dir, "obj_sketched_projected_cleaned.rds"), destdir = paste0(data.dir, "/counts"))
+```
+
+##############################
+# reanalyze high quality obj #
+##############################
+
+# re-identify doublet clusters 
+```{r}
+# sketched cells 
+sketched <- blina_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# clustering resolutions
+resolution <- c("sketch_snn_res.0.5", "sketch_snn_res.1", "sketch_snn_res.2", "sketch_snn_res.3", "sketch_snn_res.4")
+
+# clustree plot 
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_clustree_all_events_clean.pdf"), height = 7, width = 14)
+clustree(blina_clean %>% subset(cells = rownames(sketched)), prefix = "sketch_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+# ratio cluster plots and preliminary selection of doublet clusters
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events_clean.pdf"), height = 7, width = 14, onefile = T)
+for (res in resolution) {
+  blina_clean <- select_dbt(blina_clean, clusters = res, selected_clusters = res)
+  
+  # plots
+  print(ratio_cluster_plot(blina_clean, clusters = res))
+}
+dev.off()
+
+# dimplots grouped by cluster at each resolution 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_clusters_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+print(DimPlot(blina_clean, reduction = 'umap', group.by = res, label = T) + 
+  labs(title = paste0(res)))
+}
+dev.off()
+
+##########################
+##       choose         ##
+##   sketch_snn_res.1   ##
+##                      ##
+##########################
+
+# check clustering for each cluster at resolution 1
+Idents(blina_clean) <- "sketch_snn_res.1"
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_dimplot_highlighted_clusters_res1_clean.pdf"), height = 7, width = 9, onefile = T)
+max_i <- length(unique(blina_clean$sketch_snn_res.1)) - 2
+for (i in 0:max_i) {
+  print(DimPlot(blina_clean, cells.highlight = WhichCells(blina_clean, idents = as.character(i))))
+}
+dev.off()
+
+# subcluster 17
+Idents(blina_clean) <- "sketch_snn_res.1"
+blina_clean <- FindSubCluster(blina_clean, cluster = 17, graph.name = "sketch_snn", resolution = 0.1, subcluster.name = "sub.cluster")
+
+# coerce subcluster names for project_data() to work 
+blina_clean@meta.data <- blina_clean@meta.data %>% 
+  mutate(sub.cluster = str_replace(as.character(sub.cluster), "_", "."))
+
+# project chosen clustering to all cells
+blina_clean <- project_data(obj = blina_clean,
+                     data_query = blina_clean, 
+                     ref_clusters = "sub.cluster", 
+                     FSC.A="FSC.A",
+                     FSC.H="FSC.H",
+                     pred_name="pred_snn_res.1",
+                     chunk_size=1000000, 
+                     assay_ref = "sketch",
+                     assay_query = "FACS")
+
+# ratio cluster plot for all projected cells 
+p1 <- blina_clean@meta.data %>%  group_by(pred_snn_res.1, ratio_anno) %>% count(ratio_anno) %>% 
+    ggplot(aes(x = reorder(pred_snn_res.1, as.numeric(pred_snn_res.1), FUN = max), y = n, fill = ratio_anno)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_fill_manual(values = rev(c("orange2", "dodgerblue2"))) +
+    xlab("Clusters") +
+    labs(y = "Count") +
+    ggtitle("Cluster Analysis") +
+    theme_minimal()
+
+pdf(paste0(plot.dir, "01_doublets/", Sys.Date(), "_", exp, "_ratio_cluster_plots_all_events_projected_clean.pdf"), height = 7, width = 14)
+p1
+dev.off()
+
+# export source data 
+write_xlsx(p1$data, paste0(plot.dir, "Extended_Data_Figure_5D_sourcedata.xlsx"))
+
+# select doublet clusters
+blina_clean <- select_dbt(blina_clean, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.8)
+blina_clean <- select_dbt(blina_clean, clusters = 'pred_snn_res.1', selected_clusters = "doublet_clusters_res.1", quantile = 0.85) # take this one 
+
+# add meta.data 
+dbts <- blina_clean@misc$doublet_clusters_res.1_q0.85
+blina_clean@meta.data <- blina_clean@meta.data %>% 
+  mutate(cluster_anno = if_else(condition = as.character(pred_snn_res.1) %in% dbts, true = "doublet_cluster", false = "singlet_cluster"))
+
+# plot overall UMAP ----
+blina_clean$umap_1 <- blina_clean@reductions$umap@cell.embeddings[,1]
+blina_clean$umap_2 <- blina_clean@reductions$umap@cell.embeddings[,2]
+
+# number of colors
+num <- length(unique(blina_clean@meta.data$pred_snn_res.1))
+# plot 
+pdf(paste0(plot.dir, Sys.Date(), "_blina_singletsUMAP_clustering.pdf"), height = 8, width = 10)
+blina_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=pred_snn_res.1)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(pred_snn_res.1)),size=0.05, raster.dpi=700)+
+        scale_color_manual(values = smooth_rainbow(num, range = c(0.1, 0.99))) + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+# save obj
+SeuratObject::SaveSeuratRds(object = blina_clean, file = paste0(data.dir, "obj_sketched_projected_clean.rds"), destdir = paste0(data.dir, "counts"))
+```
+
+# repeat quality control
+```{r}
+# subset meta.data from sketched cells 
+sketched <- blina_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+
+# cell numbers
+total <- 985735
+
+# cells from each time point ----
+blina_clean@meta.data %>% 
+  group_by(time) %>% 
+  count() %>% 
+  mutate(of_total = n / total)
+
+sketched %>% 
+  group_by(time) %>% 
+  count() %>% 
+  mutate(of_total = n / nrow(sketched)) 
+
+# plots
+# per time point 
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_time_points_clean.pdf"), height = 7, width = 9, onefile = T)
+DimPlot(blina_clean, group.by = "time") 
+dev.off()
+
+# check area/height ratio distribution and cutoff
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_ratio_histogram_clean.pdf"), height = 6, width = 8, onefile = T)
+hist(blina_clean@meta.data$ratio, breaks = 2000)
+cutoff <- calculateThreshold(hist(blina_clean@meta.data$ratio, breaks = 2000, plot = F))
+abline(v=cutoff) 
+dev.off()
+
+# plot some QC stuff together
+cutoff <- calculateThreshold(hist(blina_clean@meta.data$ratio, breaks = 2000, plot = F))
+p1 <- DimPlot(blina_clean, group.by = "pred_snn_res.1", label = T)
+p2 <- FeaturePlot(blina_clean, "ratio", max.cutoff = cutoff)
+p3 <- ggplot(sketched, aes(x = FSC.A , y = FSC.H, color = ratio_anno)) + geom_point()
+p4 <- DimPlot(blina_clean, group.by = "cluster_anno")
+
+pdf(paste0(plot.dir, "02_qc/", Sys.Date(), "_", exp, "_QC_plots_clean.pdf"), height = 9, width = 15)
+ggarrange(p1, p2, p3, p4)
+hist(blina_clean@meta.data$ratio, breaks = 2000)
+abline(v=cutoff) 
+dev.off()
+
+# supplement QC figures 
+blina_clean@meta.data <- blina_clean@meta.data %>% mutate(unscaled_ratio = FSC.A / FSC.H) # ratio not scaled to 0-1023
+pdf(paste0(plot.dir, Sys.Date(), "_blina_FSCratio_histogram.pdf"), height = 7, width = 4.5)
+gghistogram(blina_clean@meta.data, x = "unscaled_ratio", fill = "ratio_anno", bins = 2000, linetype = "blank") + scale_fill_manual(values = rev(c("orange2", "dodgerblue2")))  # histogram 
+dev.off()
+
+pdf(paste0(plot.dir, Sys.Date(), "_blina_FSCratio_dimplot.pdf"), height = 8, width = 10)
+blina_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=ratio_anno)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700) +
+        ggrastr::geom_point_rast(aes(color=as.factor(ratio_anno)),size=0.05, raster.dpi=700) +
+        scale_color_manual(values = rev(c("orange2", "dodgerblue2")))  + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+```
+
+# high quality singlet annotation
+```{r}
+# feature plots
+pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_feature_plots_clean.pdf"), height = 7, width = 14, onefile = T)
+FeaturePlot(blina_clean, features = colnames(blina_clean@meta.data)[c(4,5,7,11,13:20)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(blina_clean, features = colnames(blina_clean@meta.data)[21:32]) & scale_color_viridis(option = 'magma')
+FeaturePlot(blina_clean, features = colnames(blina_clean@meta.data)[c(33:42,46)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots
+resolution <- c("pred_snn_res.1")
+features <- Features(blina_clean)
+for (res in resolution) {
+  Idents(blina_clean) <- res
+  pdf(paste0(plot.dir, "03_annotation/", Sys.Date(), "_", exp, "_ridgeplots", res, "_clean.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(blina_clean, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# MEM heatmap on sketched and subclustered cells 
+sketched <- blina_clean@meta.data %>% dplyr::filter(!is.na(seurat_clusters))
+sketched <- subset(blina_clean, cells = rownames(sketched))
+MEM_heatmap(obj = sketched, markers = colnames(sketched@meta.data)[c(4,5,7,11,14:31,33:41,56)], cluster_col = "pred_snn_res.1", scale_height = 5, scale_width = 4)
+
+blina_clean@meta.data <- mutate(blina_clean@meta.data, celltype = case_when(
+  pred_snn_res.1 == "0"~"memory CD4+T cells",
+  pred_snn_res.1 == "1"~"monocytes",
+  pred_snn_res.1 == "2"~"CD16+ NK cells",
+  pred_snn_res.1 == "3"~"naive CD4+T cells",
+  pred_snn_res.1 == "4"~"memory CD8+T cells",
+  pred_snn_res.1 == "5"~"pre-DCs",
+  pred_snn_res.1 == "6"~"DCs",
+  pred_snn_res.1 == "7"~"NK cells",
+  pred_snn_res.1 == "8"~"B cells",
+  pred_snn_res.1 == "9"~"PICs",
+  pred_snn_res.1 == "10"~"B cells",
+  pred_snn_res.1 == "11"~"NKT cells",
+  pred_snn_res.1 == "12"~"naive gdT cells",
+  pred_snn_res.1 == "13"~"naive CD8+T cells",
+  pred_snn_res.1 == "14"~"CD8+ T cells",
+  pred_snn_res.1 == "15"~"PICs",
+  pred_snn_res.1 == "16"~"PICs",
+  pred_snn_res.1 == "17"~"progenitors",
+  pred_snn_res.1 == "17.1"~"progenitors",
+  pred_snn_res.1 == "17.2"~"progenitors",
+  pred_snn_res.1 == "17.3"~"DCs", # CD71 expression, probably activated 
+  pred_snn_res.1 == "18"~"gdT cells",
+  pred_snn_res.1 == "19"~"PICs",
+  pred_snn_res.1 == "20"~"memory CD4+T cells",
+  pred_snn_res.1 == "21"~"Treg",
+  pred_snn_res.1 == "22"~"PICs",
+  pred_snn_res.1 == "23"~"CD56+T cells",
+  pred_snn_res.1 == "24"~"progenitors",
+  pred_snn_res.1 == "25"~"monocytes"
+))
+
+# annotated heatmap for supplements
+# calculate MEM scores ----
+MEM <- blina_clean@meta.data %>% 
+  dplyr::select(colnames(blina_clean@meta.data)[c(4,5,7,11,14:31,33:41,58)]) %>% 
+  mutate(cluster = as.numeric(factor(celltype, levels = unique(celltype)))) # turn celltypes into ID numbers since MEM can't deal with strings 
+
+# key
+celltype_anno <- unique(blina_clean$celltype)
+
+# calculation of MEM scores
+MEM_values <-MEM(MEM[,c(1:31,33)],
+                 transform = F,
+                 choose.markers = F,
+                 markers = "all",
+                 choose.ref = F,
+                 zero.ref = F,
+                 IQR.thresh = NULL)
+
+# heatmap with celltype anno labels
+heatmap <- as.data.frame(MEM_values$MEM_matrix[[1]])
+
+cols <- colorRamp2(seq(from = -10, to = 10, length.out = 100), pals::coolwarm(100))
+h1 <- Heatmap(t(as.matrix(heatmap)),
+        hcl.colors(100, "Blue-Red 3"),
+        name = "MEM enrichment score",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "ward.D2",
+        column_title = "marker", 
+        row_title = "cluster",
+        column_labels = celltype_anno,
+        row_names_gp = gpar(fontsize = 9),
+        column_names_gp = gpar(fontsize = 9),
+        show_row_names = T,
+        cluster_rows = T,
+        cluster_columns = T,
+        show_parent_dend_line = FALSE,
+        width = ncol(heatmap)*unit(2.2, "mm"), 
+        height = nrow(heatmap)*unit(5, "mm"))
+
+# plot heatmap ----
+pdf(paste0(plot.dir, Sys.Date(), "_blina_singlets_MEMheatmap.pdf"), height = 7, width = 7)
+print(h1)
+dev.off()
+
+# export source data
+colnames(h1@matrix) <- h1@column_names_param$labels
+write_xlsx(as.data.frame(h1@matrix) %>% rownames_to_column(var = "marker"), paste0(plot.dir, "Extended_Data_Figure_5F_sourcedata.xlsx"))
+
+# save annotated obj
+SeuratObject::SaveSeuratRds(object = blina_clean, 
+                            file = paste0(data.dir, "obj_sketched_projected_annotated_clean.rds"), destdir = paste0(data.dir, "/counts"))
+```
+
+# doublet annotation
+```{r}
+# subset doublet clusters 
+DefaultAssay(blina_clean) <- 'FACS'
+dbts_blina <- subset(blina_clean, subset = cluster_anno == "doublet_cluster") 
+
+# new assay
+dbts_blina[["dbts"]] <- CreateAssay5Object(counts = dbts_blina@assays$FACS$counts, data = dbts_blina@assays$FACS$data)
+DefaultAssay(dbts_blina) <- "dbts"
+
+# repeat seurat workflow
+resolution <- c(0.3, 0.5, 1, 2, 3)
+n_dims <- Features(dbts_blina) %>% length()
+dbts_blina <- dbts_blina %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=n_dims-1, approx=F) %>%
+    FindNeighbors(dims = 1:n_dims-1) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_blina, file = paste0(data.dir, "obj_doublets.rds"))
+
+# plots
+# directory
+ifelse(!dir.exists(paste0(plot.dir, "04_doublet_annotation/")), dir.create(paste0(plot.dir, "04_doublet_annotation/")), FALSE)
+
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_dimplot_clusters_doublets.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_blina, reduction = 'umap', group.by = paste0("dbts_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_feature_plots_doublets.pdf"), height = 9, width = 14, onefile = T)
+FeaturePlot(dbts_blina, features = colnames(dbts_blina@meta.data)[c(4,5,7,11,13:20)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_blina, features = colnames(dbts_blina@meta.data)[21:32]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_blina, features = colnames(dbts_blina@meta.data)[c(33:42,46)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots 
+features <- Features(dbts_blina)
+for (res in resolution) {
+  Idents(dbts_blina) <- paste0("dbts_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_res", res, ".pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_blina, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# clustree
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_clustree_doublets.pdf"), height = 7, width = 14)
+clustree(dbts_blina, prefix = "dbts_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+#####################
+##     choose      ##
+##   resolution 1  ## 
+#####################
+
+# MEM heatmap 
+MEM_heatmap(obj = dbts_blina, markers = colnames(dbts_blina@meta.data)[c(4,5,7,11,14:31,33:41,63)], cluster_col = "dbts_snn_res.1", scale_height = 5, scale_width = 4)
+
+# annotation
+dbts_blina@meta.data <- mutate(dbts_blina@meta.data, doublet_type = case_when(
+  dbts_snn_res.1 == "0"~"B*CD8+T",
+  dbts_snn_res.1 == "1"~"B*CD8+T",
+  dbts_snn_res.1 == "2"~"B*T", 
+  dbts_snn_res.1 == "3"~"B*CD4+T",
+  dbts_snn_res.1 == "4"~"B*CD4+T",
+  dbts_snn_res.1 == "5"~"B*CD4+T",
+  dbts_snn_res.1 == "6"~"mono*progenitors",
+  dbts_snn_res.1 == "7"~"B*CD4+T", 
+  dbts_snn_res.1 == "8"~"progenitors", 
+  dbts_snn_res.1 == "9"~"B*B", 
+  dbts_snn_res.1 == "10"~"B*gdT",
+  dbts_snn_res.1 == "11"~"mono*T",
+  dbts_snn_res.1 == "12"~"B*gdT",
+  dbts_snn_res.1 == "13"~"B*CD56+CD8+T",
+  dbts_snn_res.1 == "14"~"mono*NK",
+  dbts_snn_res.1 == "15"~"B*T",
+  dbts_snn_res.1 == "16"~"B*T",
+  dbts_snn_res.1 == "17"~"remove",
+  dbts_snn_res.1 == "18"~"B*CD4+T" 
+))
+
+# save annotated obj 
+SeuratObject::SaveSeuratRds(object = dbts_blina, file = paste0(data.dir, "obj_doublets_annotated.rds"))
+
+# subset on heterotypic clusters 
+keep <- c("mono*progenitors", "B*CD8+T", "mono*NK", "mono*T", "B*CD4+T",
+          "B*gdT", "B*DC", "B*T", "B*CD56+CD8+T")
+dbts_blina_clean <- subset(dbts_blina, subset = doublet_type %in% keep)
+
+# remove meta.data cols to avoid confusion
+dbts_blina_clean@meta.data <- dbts_blina_clean@meta.data %>% 
+  dplyr::select(-c(dbts_snn_res.0.3, dbts_snn_res.0.5, dbts_snn_res.1, dbts_snn_res.2, dbts_snn_res.3, doublet_type))
+
+# repeat Seurat workflow
+resolution <- c(0.5, 1, 2, 3)
+n_dims <- Features(dbts_blina_clean) %>% length()
+dbts_blina_clean <- dbts_blina_clean %>% 
+    FindVariableFeatures() %>% 
+    ScaleData() %>% 
+    RunPCA(npcs=n_dims-1, approx=F) %>%
+    FindNeighbors(dims = 1:n_dims-1) %>%
+    FindClusters(resolution = resolution) %>% 
+    RunUMAP(dims = 1:n_dims-1, return.model = TRUE)
+
+# save obj 
+SeuratObject::SaveSeuratRds(object = dbts_blina_clean, file = paste0(data.dir, "obj_doublets_clean.rds"))
+```
+
+# high quality heterotypic doublet annotation 
+```{r}
+# plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_dimplot_clusters_doublets_clean.pdf"), height = 7, width = 9, onefile = T)
+for (res in resolution) {
+  print(DimPlot(dbts_blina_clean, reduction = 'umap', group.by = paste0("dbts_snn_res.", res), label = T))
+}
+dev.off()
+
+# feature plots
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_feature_plots_doublets_clean.pdf"), height = 9, width = 14, onefile = T)
+FeaturePlot(dbts_blina_clean, features = colnames(dbts_blina_clean@meta.data)[c(4,5,7,11,13:20)]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_blina_clean, features = colnames(dbts_blina_clean@meta.data)[21:32]) & scale_color_viridis(option = 'magma')
+FeaturePlot(dbts_blina_clean, features = colnames(dbts_blina_clean@meta.data)[c(33:42,46)]) & scale_color_viridis(option = 'magma')
+dev.off()
+
+# ridge plots 
+features <- Features(dbts_blina_clean)
+for (res in resolution) {
+  Idents(dbts_blina_clean) <- paste0("dbts_snn_res.", res)
+  pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_ridgeplots_doublets_res", res, "_clean.pdf"), height = 8, width = 5, onefile = T)
+  for (f in features) {
+    print(RidgePlot(dbts_blina_clean, features = f, slot = 'data'))
+  }
+  dev.off()
+}
+
+# clustree
+pdf(paste0(plot.dir, "04_doublet_annotation/", Sys.Date(), "_", exp, "_clustree_doublets_clean.pdf"), height = 7, width = 14)
+clustree(dbts_blina_clean, prefix = "dbts_snn_res.", exprs = 'data', assay = 'sketch')
+dev.off() 
+
+########################
+##       choose       ##
+##     resolution 1   ##
+########################
+
+# MEM heatmap 
+MEM_heatmap(obj = dbts_blina_clean, markers = colnames(dbts_blina_clean@meta.data)[c(4,5,7,11,14:31,33:41,62)], cluster_col = "dbts_snn_res.1", scale_height = 5, scale_width = 4)
+
+# subcluster cluster 0, not really triplets but CD4 and CD8 separately 
+Idents(dbts_blina_clean) <- "dbts_snn_res.1"
+dbts_blina_clean <- FindSubCluster(dbts_blina_clean, 
+                                   cluster = "0", 
+                                   graph.name = "dbts_snn", 
+                                   resolution = 0.4, 
+                                   subcluster.name = "sub.cluster")
+# subcluster cluster 14
+Idents(dbts_blina_clean) <- "sub.cluster"
+dbts_blina_clean <- FindSubCluster(dbts_blina_clean, 
+                                   cluster = "14", 
+                                   graph.name = "dbts_snn", 
+                                   resolution = 0.2, 
+                                   subcluster.name = "sub.cluster")
+
+# annotation
+dbts_blina_clean@meta.data <- mutate(dbts_blina_clean@meta.data, doublet_type = case_when(
+  sub.cluster == "0_0"~"B*CD4+T*CD8+T",
+  sub.cluster == "0_1"~"B*CD4+T*CD8+T",
+  sub.cluster == "0_2"~"B*CD4+T",
+  sub.cluster == "0_3"~"B*CD8+T",
+  sub.cluster == "0_4"~"B*CD4+T*CD8+T",
+  dbts_snn_res.1 == "1"~"B*CD8+T",
+  dbts_snn_res.1 == "2"~"B*CD4+T", 
+  dbts_snn_res.1 == "3"~"B*CD4+T",
+  dbts_snn_res.1 == "4"~"B*CD8+T",
+  dbts_snn_res.1 == "5"~"B*CD4+T",
+  dbts_snn_res.1 == "6"~"Mono*Progenitors",
+  dbts_snn_res.1 == "7"~"B*CD4+T", 
+  dbts_snn_res.1 == "8"~"B*CD8+T", 
+  dbts_snn_res.1 == "9"~"B*gdT", 
+  dbts_snn_res.1 == "10"~"Mono*T",
+  dbts_snn_res.1 == "11"~"B*gdT",
+  dbts_snn_res.1 == "12"~"B*NKT",
+  dbts_snn_res.1 == "13"~"Mono*NK",
+  sub.cluster == "14_0"~"B*CD4+T",
+  sub.cluster == "14_1"~"B*CD8+T",
+  dbts_snn_res.1 == "15"~"B*NK*gdT",
+  dbts_snn_res.1 == "16"~"Mono*Progenitors",
+  dbts_snn_res.1 == "17"~"B*CD4+T"
+))
+
+# annotated heatmap for supplements
+# calculate MEM scores ----
+MEM <- dbts_blina_clean@meta.data %>% 
+  dplyr::select(colnames(dbts_blina_clean@meta.data)[c(4,5,7,11,14:31,33:41,65)]) %>% 
+  mutate(cluster = as.numeric(factor(doublet_type, levels = unique(doublet_type)))) # turn doublet_types into ID numbers since MEM can't deal with strings 
+
+# key
+doublet_type_anno <- unique(dbts_blina_clean$doublet_type)
+
+# calculation of MEM scores
+MEM_values <-MEM(MEM[,c(1:31,33)],
+                 transform = F,
+                 choose.markers = F,
+                 markers = "all",
+                 choose.ref = F,
+                 zero.ref = F,
+                 IQR.thresh = NULL)
+
+# heatmap with douublet type anno labels
+heatmap <- as.data.frame(MEM_values$MEM_matrix[[1]])
+cols <- colorRamp2(seq(from = -10, to = 10, length.out = 100), pals::coolwarm(100))
+h2 <- Heatmap(t(as.matrix(heatmap)),
+        hcl.colors(100, "Blue-Red 3"),
+        name = "MEM enrichment score",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "ward.D2",
+        column_title = "marker", 
+        row_title = "cluster",
+        column_labels = doublet_type_anno,
+        row_names_gp = gpar(fontsize = 9),
+        column_names_gp = gpar(fontsize = 9),
+        show_row_names = T,
+        cluster_rows = T,
+        cluster_columns = T,
+        show_parent_dend_line = FALSE,
+        width = ncol(heatmap)*unit(1, "mm"), 
+        height = nrow(heatmap)*unit(15, "mm"))
+
+# plot heatmap ----
+pdf(paste0(plot.dir, Sys.Date(), "_blina_doublets_MEMheatmap.pdf"), height = 7, width = 7)
+print(h2)
+dev.off()
+
+# export source data
+colnames(h2@matrix) <- h2@column_names_param$labels
+write_xlsx(as.data.frame(h2@matrix) %>% rownames_to_column(var = "marker"), paste0(plot.dir, "Extended_Data_Figure_5J_sourcedata.xlsx"))
+
+# save annotated obj 
+SeuratObject::SaveSeuratRds(object = dbts_blina_clean, file = paste0(data.dir, "obj_doublets_annotated_clean.rds"))
+```
+
+# quantification and normalization
+```{r}
+# normalization ----
+# singlet cell types 
+cell_num <- as.data.frame(table(blina_clean$celltype, blina_clean$sample)) %>% 
+  pivot_wider(names_from = Var2, values_from = Freq) %>% 
+  column_to_rownames("Var1") 
+
+# total cell numbers per sample, only removing low quality clusters 
+sample_total <- as.data.frame(table(blina$pred_snn_res.1, blina$sample)) %>% 
+  pivot_wider(names_from = Var2, values_from = Freq) %>% 
+  dplyr::filter(!Var1 %in% c("28")) %>% 
+  summarise(across(2:25, sum))
+
+# extract cluster sizes per condition, sample 
+doublet_types <- c("B*CD4+T", "B*CD8+T", "B*CD4+T*CD8+T",
+                   "B*gdT", "B*NKT", "Mono*NK", "B*NK*gdT",
+                   "Mono*T", "Mono*Progenitors")
+fc_blina <- as.tibble(dbts_blina_clean@meta.data) %>% 
+  mutate(doublet_type = factor(doublet_type, levels = doublet_types)) %>% 
+  mutate(time = factor(time, levels = unique(time))) %>% 
+  mutate(sample = factor(sample, levels = unique(sample))) %>% 
+  group_by(doublet_type, sample, .drop = F) %>% 
+  count() %>% 
+  mutate(time = 0) %>%
+  mutate(time = if_else(str_detect(sample, "2"), true = 0.25, false = time)) %>%
+  mutate(time = if_else(str_detect(sample, "3"), true = 1, false = time)) %>%
+  mutate(time = if_else(str_detect(sample, "4"), true = 2, false = time)) %>%
+  mutate(time = if_else(str_detect(sample, "5"), true = 3, false = time)) %>%
+  mutate(time = if_else(str_detect(sample, "6"), true = 5, false = time))
+
+# total cell numbers per sample (only removing low quality cells)
+fc_blina$total <- 0
+for (n in 1:nrow(fc_blina)) {
+  fc_blina$total[n] <- sample_total[[fc_blina$sample[n]]]
+}
+
+# frequency
+fc_blina <- fc_blina %>% 
+  mutate(freq = n / total)
+
+# add corresponding control frequencies 
+controls <- fc_blina %>% 
+  dplyr::filter(time == 0) %>% 
+  dplyr::group_by(doublet_type) %>% 
+  summarize(mean = mean(freq)) %>% 
+  column_to_rownames("doublet_type")
+
+fc_blina <- fc_blina %>% 
+  mutate(control_mean = controls[doublet_type,]) %>% 
+  mutate(FC = freq / control_mean) %>% 
+  mutate(log2FC = log2(FC))
+
+colors <- c("B*CD4+T" = "#427D9D", 
+            "B*CD8+T" = "#071952", 
+            "B*CD4+T*CD8+T" = "aquamarine4",
+            "B*gdT" = "#115768",
+            "B*NKT" = "#944361",
+            "NK*gdT" = "#B473A6", 
+            "Mono*T" = "#85915F", 
+            "Mono*Progenitors" = "#BCA957", 
+            "Mono*NK" = "#8A6680")
+
+# transparant lines 
+library(colorspace)
+colors_t <- adjust_transparency(colors, alpha = 0.3)
+names(colors_t) <- names(colors)
+
+# not smoothed, +/- SD
+pdf(paste0(plot.dir, Sys.Date(), "_blina_time_course_lineplot_noerrorbars_VF.pdf"), height = 6, width = 12)
+p <- ggplot(fc_blina %>% dplyr::filter(doublet_type != "NK*gdT") %>% dplyr::group_by(doublet_type, time) %>% summarise(mean = mean(log2FC), SD = sd(log2FC)), 
+       aes(x=time, y = mean, fill = doublet_type, ymin = mean - SD, ymax = mean + SD)) + 
+  geom_ribbon() + geom_line(aes(color= doublet_type)) + 
+  theme_classic() + 
+  scale_fill_manual(values = colors_t) + scale_color_manual(values = colors) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = c(-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0), limits = c(NA, 8.5))
+print(p)
+dev.off()
+
+# export source data 
+write_xlsx(p$data, paste0(plot.dir, "Figure_3K_sourcedata.xlsx"))
+```
+
+# quantify B cell event frequency across singlets and doublets
+```{r}
+# count celltype prevalence 
+B <- blina_clean@meta.data %>% group_by(celltype, time, sample) %>% count() 
+
+# add total sample sizes 
+B$total <- 0
+for (n in 1:nrow(B)) {
+  B$total[n] <- sample_total[[B$sample[n]]]
+}
+
+# frequency
+B <- B %>% 
+  mutate(freq = n / total)
+
+# plot
+ggline(B, x = "time", y = "freq", color = "celltype", 
+       add = "mean_sd", facet.by = "celltype") + 
+  theme(legend.position = "none")
+
+# add B cells in heterotypic doublets 
+B_het <- fc_blina %>% rename(celltype = doublet_type) %>% dplyr::select(-c(control_mean, FC, log2FC)) 
+B_het <- rbind(B, B_het) %>% dplyr::filter(celltype != "PICs") %>% dplyr::filter(str_detect(celltype, "B"))
+
+# add B cells in heterotypic and homotypic doublets (= all events that include B cells)
+B_all <- dbts_blina@meta.data %>% dplyr::filter(doublet_type == "B*B") %>% group_by(doublet_type, time, sample) %>% count()
+
+# add total sample sizes
+B_all$total <- 0
+for (n in 1:nrow(B_all)) {
+  B_all$total[n] <- sample_total[[B_all$sample[n]]]
+}
+
+# frequencies 
+B_all <- B_all %>% 
+  mutate(freq = n / total) %>% 
+  rename(celltype = doublet_type) 
+B_all <- rbind(B_het, B_all)  
+
+# stats for all B cells minus homotypic 
+B_het %>% group_by(time, sample) %>% summarize(sum = sum(freq)) %>% group_by(time) %>% shapiro_test(sum) # normality can be assumed
+B_het %>% group_by(time, sample) %>% summarize(sum = sum(freq)) %>% ungroup() %>% t_test(sum ~ time, ref.group = "0") # multiple t test 
+
+# -> significant decline of B cell events with time, but slight  
+
+# plots for supplements (all B events minus homotypic)----
+colors <- c("B cells" = "#2C48AE",
+            "B*CD4+T" = "#427D9D", 
+            "B*CD8+T" = "#071952",
+            "B*CD4+T*CD8+T" = "aquamarine4", 
+            "B*gdT" = "#115768",
+            "B*NKT" = "#944361", 
+            "B*NK*gdT" = "#B473A6")
+
+# scale so that the sum of all means at t=0 is 100% 
+sum <- (B_het %>% dplyr::filter(time == 0) %>% group_by(celltype) %>% summarize(mean = mean(freq)))$mean %>% sum()
+B_het <- B_het %>% mutate(scaled = (freq / sum) * 100)
+pdf(paste0(plot.dir, Sys.Date(), "_blina_time_course_Bfreq_stackedbar_VF.pdf"), height = 8, width = 13)
+p <- ggbarplot(B_het, 
+          x = "time", y = "scaled", add = "mean_sd",
+          fill = "celltype") + scale_fill_manual(values = colors)
+print(p)
+dev.off()
+
+# export source data 
+write_xlsx(p$data, paste0(plot.dir, "/Extended_Data_Figure_5K_sourcedata.xlsx"))
+
+# line plot of B cells and PICs
+pdf(paste0(plot.dir, Sys.Date(), "_blina_time_course_Bfreq_lineplot_VF.pdf"), height = 8, width = 13)
+lin <- ggline(B %>% dplyr::filter(celltype %in% c("B cells", "PICs")), 
+       x = "time", y = "freq", color = "celltype", 
+       add = "mean_sd", size = 1, numeric.x.axis = T) + 
+  theme(legend.position = "none") + scale_color_manual(values = c("#2C48AE", "darkgrey"))
+print(lin)
+dev.off()
+
+# export source data 
+write_xlsx(lin$data, paste0(plot.dir, "Figure_3J_sourcedata.xlsx"))
+```
+
+# plots 
+```{r}
+# singlets ----
+colors <- c("DCs" = "#805C75", 
+            "pre-DCs" = "#D3BEDA",
+            "B cells" = "#2C48AE",
+            "CD8+ T cells" = "#7AA1A7",
+            "memory CD4+T cells" = "#54BA64",
+            "memory CD8+T cells" = "#375D4C",
+            "naive CD4+T cells" = "#60913E",
+            "naive CD8+T cells" = "#497775",
+            "monocytes" = "#A26272", 
+            "NK cells" = "#7C5FA1",
+            "NKT cells" = "#D6447E",
+            "CD16+ NK cells" = "#3F338A",
+            "PICs" = "#ED8706", 
+            "gdT cells" = "#3F426A", 
+            "naive gdT cells" = "#3F596A",
+            "Treg" = "#DFE390",
+            "CD56+T cells" = "#6FA3C2",
+            "progenitors" = "#BB2E25")
+
+# plot 
+blina_clean$umap_1 <- blina_clean@reductions$umap@cell.embeddings[,1]
+blina_clean$umap_2 <- blina_clean@reductions$umap@cell.embeddings[,2]
+
+pdf(paste0(plot.dir, Sys.Date(), "_blina_singletsUMAP.pdf"), height = 8, width = 10)
+blina_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=celltype)) +
+        ggrastr::geom_point_rast(size=0.2,color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(celltype)),size=0.05, raster.dpi=700)+
+        scale_color_manual(values=colors)+theme_classic()+
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+# densities for all time points 
+pdf(paste0(plot.dir, Sys.Date(), "_blina_time_course_density_all_timepoints_singlets.pdf"), height = 5, width = 14)
+ggplot(blina_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.2, method = "auto") + 
+  facet_wrap(~time, ncol = 6) + scale_color_viridis() + theme_classic()
+dev.off()
+
+# supplement figure features
+Feature_Plot <- FeaturePlot(blina_clean, features=colnames(blina_clean@meta.data)[c(4,5,7,11,14:31, 33:41,46)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 1.5)
+for(i in 1:length(Feature_Plot)) suppressMessages({
+  Feature_Plot[[i]] <- Feature_Plot[[i]] + 
+    scale_colour_gradientn(colours = pals::parula(n = 100)) +
+    theme_classic() +
+    NoLegend() + 
+    NoAxes()
+})
+pdf(paste0(plot.dir, Sys.Date(), "_blina_singletsUMAP_fetaures.pdf"), height = 8, width = 6)
+print(cowplot::plot_grid(plotlist = Feature_Plot, nrow = 7))
+dev.off()
+
+# doublets ----
+colors <- c("B*CD4+T" = "#427D9D", 
+            "B*CD8+T" = "#071952", 
+            "B*CD4+T*CD8+T" = "aquamarine4",
+            "B*gdT" = "#115768",
+            "B*NKT" = "#944361",
+            "B*NK*gdT" = "#B473A6", 
+            "Mono*T" = "#85915F", 
+            "Mono*Progenitors" = "#BCA957", 
+            "Mono*NK" = "#8A6680")
+
+# without labels 
+dbts_blina_clean$umap_1 <- dbts_blina_clean@reductions$umap@cell.embeddings[,1]
+dbts_blina_clean$umap_2 <- dbts_blina_clean@reductions$umap@cell.embeddings[,2]
+
+pdf(paste0(plot.dir, Sys.Date(), "_blina_doubletsUMAP_VF_largerdots.pdf"), height = 8, width = 10)
+dbts_blina_clean@meta.data %>% 
+        ggplot(aes(umap_1, umap_2, color=doublet_type)) +
+        ggrastr::geom_point_rast(size=2, color="black", raster.dpi=700)+
+        ggrastr::geom_point_rast(aes(color=as.factor(doublet_type)),size=1.5, raster.dpi=700)+
+        scale_color_manual(values=colors)+theme_classic()+
+        guides(colour = guide_legend(override.aes = list(size=5)))
+dev.off()
+
+# supplement figure features
+Feature_Plot <- FeaturePlot(dbts_blina_clean, features=colnames(dbts_blina_clean@meta.data)[c(4,5,7,11,14:31, 33:41,46)], alpha = 1, combine=F, raster = T, reduction = "umap", pt.size = 1.5)
+for(i in 1:length(Feature_Plot)) suppressMessages({
+  Feature_Plot[[i]] <- Feature_Plot[[i]] + 
+    scale_colour_gradientn(colours = pals::parula(n = 100)) +
+    theme_classic() +
+    NoLegend() + 
+    NoAxes()
+})
+pdf(paste0(plot.dir, Sys.Date(), "_blina_doubletsUMAP_features.pdf"), height = 8, width = 6)
+print(cowplot::plot_grid(plotlist = Feature_Plot, nrow = 7))
+dev.off()
+
+# densities 1h 
+pdf(paste0(plot.dir, Sys.Date(), "_blina_time_course_density.pdf"), height = 6, width = 10)
+ggplot(dbts_blina_clean@meta.data %>% dplyr::filter(time %in% c(0,1)), aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.2, method = "auto") + 
+  facet_wrap(~time, ncol = 3) + scale_color_viridis() + theme_classic()
+dev.off()
+
+# all time points for the supplements 
+pdf(paste0(plot.dir, Sys.Date(), "_blina_time_course_density_all_timepoints_doublets.pdf"), height = 5, width = 20)
+ggplot(dbts_blina_clean@meta.data, aes(x=umap_1, y = umap_2)) + 
+  geom_pointdensity(size=0.2, method = "auto") + 
+  facet_wrap(~time, ncol = 6) + scale_color_viridis() + theme_classic()
+dev.off()
+```
+
+# export obj as data.frames for publication 
+```{r}
+# OVERALL CELLULAR LANDSCAPE --------------------------------------------------------
+# all events  
+all <- blina@meta.data %>% 
+  # filter out low quality clusters that do not contribute to frequency calculations 
+  dplyr::filter(!pred_snn_res.1 %in% c("28")) %>% 
+  # remove columns 
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, Caspase, LD, 
+                   aquisition_time, sketch_snn_res.0.5, sketch_snn_res.1, 
+                   sketch_snn_res.2, sketch_snn_res.3, sketch_snn_res.4, 
+                   seurat_clusters, sub.cluster, pred_snn_res.1, 
+                   cluster_anno, celltype)) 
+
+# final overall landscape data 
+# add umap values 
+blina_clean$umap_1 <- blina_clean@reductions$umap@cell.embeddings[,1]
+blina_clean$umap_2 <- blina_clean@reductions$umap@cell.embeddings[,2]
+
+overall <- blina_clean@meta.data %>% 
+  # remove columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, Caspase, LD, 
+                   aquisition_time, seurat_clusters, sketch_snn_res.0.5,
+                   sketch_snn_res.1, sketch_snn_res.2, sketch_snn_res.3,
+                   sketch_snn_res.4, sub.cluster))
+
+# make sure all values except clustering, cluster_anno, celltype and umap_1/2 are the same 
+identical(all[rownames(overall),], overall[,1:42]) # yes 
+
+# merge both data.frames 
+overall_landscape <- left_join(all, overall)
+
+# save as csv
+write_csv(overall_landscape, file = paste0(data.dir, Sys.Date(), "_blina_time_course_overall_landscape.csv"), 
+          col_names = T, quote = "all")
+
+
+# INTERACTING LANDSCAPE --------------------------------------------------------
+dbts <- dbts_blina@meta.data %>% 
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, Caspase, LD,
+                   aquisition_time, seurat_clusters, sketch_snn_res.0.5,
+                   sketch_snn_res.1, sketch_snn_res.2, sketch_snn_res.3,
+                   sketch_snn_res.4, sub.cluster, pred_snn_res.1,
+                   celltype, nCount_dbts, nFeature_dbts, dbts_snn_res.0.3,
+                   dbts_snn_res.0.5, dbts_snn_res.1, dbts_snn_res.2,
+                   dbts_snn_res.3, doublet_type))
+
+
+# final overall landscape data 
+# add umap values 
+dbts_blina_clean$umap_1 <- dbts_blina_clean@reductions$umap@cell.embeddings[,1]
+dbts_blina_clean$umap_2 <- dbts_blina_clean@reductions$umap@cell.embeddings[,2]
+
+dbts_final <- dbts_blina_clean@meta.data %>%
+  # drop unnecessary columns
+  dplyr::select(-c(orig.ident, nCount_FACS, nFeature_FACS, Caspase, LD,
+                   aquisition_time, seurat_clusters, sketch_snn_res.0.5,
+                   sketch_snn_res.1, sketch_snn_res.2, sketch_snn_res.3,
+                   sketch_snn_res.4, pred_snn_res.1, celltype, nCount_dbts, 
+                   nFeature_dbts, dbts_snn_res.0.5, dbts_snn_res.1,
+                   dbts_snn_res.2, dbts_snn_res.3)) %>% 
+  rename(dbts_snn_res.1 = sub.cluster, interaction = doublet_type)
+
+# make sure all values except clustering, doublet type and umap_1/2 are the same 
+identical(dbts[rownames(dbts_final),], dbts_final[,c(1:42, 44)]) # yes 
+
+# join
+interacting_landscape <- left_join(dbts, dbts_final)
+
+# save as csv
+write_csv(interacting_landscape, file = paste0(data.dir, Sys.Date(), "_blina_time_course_interacting_landscape.csv"), 
+          col_names = T, quote = "all")
+```
+
