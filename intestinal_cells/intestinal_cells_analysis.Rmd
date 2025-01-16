@@ -43,7 +43,7 @@ for (d in c(data.dir, plot.dir, input.dir)) {
 ```
 
 # load data 
-```{r, message=FALSE, warning=FALSE}
+```{r message=FALSE, warning=FALSE}
 # find channel value csv files 
 files <- dir(paste0(input.dir), pattern="*.csv")
 
@@ -164,7 +164,7 @@ for (res in resolution) {
   }
   dev.off()
 }
-```
+``` 
 
 # look at CD45+ EPCAM+ double-positive events / potential interactions
 ```{r}
@@ -400,8 +400,7 @@ dev.off()
 
 # plot singlet object 
 ```{r}
-# obj_clean <- readRDS(paste0(data.dir, "obj_sketched_subclustered_projected_annotated_filtered.rds"))
-
+# repeat annotation 
 obj_clean@meta.data <- mutate(obj_clean@meta.data, celltype = case_when(
   pred_snn_res.1 == "0" ~ "Epithelial cells",
   pred_snn_res.1 == "1" ~ "Epithelial cells",
@@ -574,7 +573,7 @@ dbts_obj <- FindSubCluster(dbts_obj, cluster = "21", resolution = 0.2, subcluste
 
 DimPlot(dbts_obj, reduction = "umap_dbts", group.by = "sub.cluster", label =T)
 
-# anno ----
+# annotation ----
 # unclear which T cell populations are also truly positive for CD4 in addition to CD8
 dbts_obj@meta.data <- mutate(dbts_obj@meta.data, doublet_type = case_when(
   FACS_snn_res.2 == "0"~ "Ep*CD4+ TCRab+ T cells",
@@ -591,10 +590,10 @@ dbts_obj@meta.data <- mutate(dbts_obj@meta.data, doublet_type = case_when(
   FACS_snn_res.2 == "11"~ "Ep*CD8+ TCRgd+ T cells",
   FACS_snn_res.2 == "12"~ "Ep*CD8+ TCRgd+ T cells",
   FACS_snn_res.2 == "13"~ "Ep", # homotypic 
-  FACS_snn_res.2 == "14"~ "ISC*CD8+ TCRab+ T cells", # subcluster 
+  FACS_snn_res.2 == "14"~ "ISC*CD8+ TCRab+ T cells",
   FACS_snn_res.2 == "15"~ "TCRab*TCRgd",
   FACS_snn_res.2 == "16"~ "Ep*CD8+ TCRgd+ T cells",
-  FACS_snn_res.2 == "17"~ "Ep*CD8+ TCRgd+ T cells", # subcluster? 
+  FACS_snn_res.2 == "17"~ "Ep*CD8+ TCRgd+ T cells",
   FACS_snn_res.2 == "18"~ "Ep*T",
   FACS_snn_res.2 == "19"~ "Ep", # potentially singlets 
   FACS_snn_res.2 == "20"~ "ISC*T",
@@ -638,7 +637,7 @@ dbts_obj_clean <- dbts_obj_clean %>%
 
 DimPlot(dbts_obj_clean, group.by = "doublet_type", label = T, reduction = "umap_clean")
 
-# only markers that have been used during singlet anno -------------
+# only markers that have been used during singlet annotation -------------
 dbts_obj_clean_sub <- dbts_obj_clean
 VariableFeatures(dbts_obj_clean_sub) <- VariableFeatures(dbts_obj_clean_sub)[!VariableFeatures(dbts_obj_clean_sub) %in% c("CD274", "Ly6G", "CD279", "F4-80")]
 n_dims <- VariableFeatures(dbts_obj_clean_sub) %>% length()
